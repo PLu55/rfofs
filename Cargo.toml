@@ -1,0 +1,34 @@
+[package]
+name = "rfofs"
+version = "0.1.0"
+edition = "2024"
+ 
+[[bin]]
+name = "rfofs"
+path = "src/main.rs"
+ 
+[lib]
+name = "rfofs"
+path = "src/lib.rs"
+ 
+[dependencies]
+# Audio I/O
+jack = "0.13"
+ 
+# Lock-free queues
+rtrb = "0.3"          # lock-free SPSC ring buffer (audio-safe)
+ 
+# Slab allocator for active FOF pool
+slab = "0.4"
+ 
+# Logging (non-allocating on hot path via log facade)
+log = "0.4"
+env_logger = "0.11"
+ 
+[profile.release]
+opt-level = 3
+lto = true
+ 
+[profile.release.package."*"]
+opt-level = 3
+ 
