@@ -91,12 +91,7 @@ impl TimeWheelConsumer {
         out: &mut Vec<FofParams>,
     ) {
         let block_end = block_start + block_size;
-        loop {
-            // rtrb: peek via read_chunk(1) then check before consuming.
-            let chunk = match self.rx.read_chunk(1) {
-                Ok(c) => c,
-                Err(_) => break, // empty
-            };
+        while let Ok(chunk) = self.rx.read_chunk(1) {
             // SAFETY: chunk always has exactly 1 element.
             let params = *chunk.as_slices().0.first().unwrap();
             if params.start_sample < block_end {
