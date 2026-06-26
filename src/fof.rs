@@ -19,9 +19,9 @@ pub struct FofParams {
     /// Formant frequency at grain start (Hz).
     pub f: f32,
 
-    /// Formant frequency at grain end (Hz). Equal to `f` if no glissando.
-    /// Glissando is exponential (linear in octaves/sec).
-    pub f_end: f32,
+    /// Glissando rate in octaves/second.  0.0 = no pitch change.
+    /// Positive = upward, negative = downward.
+    pub gliss: f32,
 
     /// Initial sine phase (radians).
     pub phi: f32,
@@ -118,8 +118,8 @@ pub struct FofState {
     /// Instantaneous formant frequency (Hz), updated each sample for glissando.
     pub f_current: f32,
 
-    /// Per-sample multiplicative glissando factor: exp(ln(f_end/f) / duration).
-    /// == 1.0 when f_end == f (no glissando).
+    /// Per-sample multiplicative glissando factor: 2^(gliss / sample_rate).
+    /// == 1.0 when gliss == 0.0 (no glissando).
     pub log_f_factor: f32,
 
     /// Samples elapsed since the start of the attack phase.
@@ -133,24 +133,41 @@ pub struct FofState {
 
     /// Effective fade-out duration in samples (from params or kill request).
     pub effective_fade_dur: u32,
+
+    /// Reciprocal of fof_amax(alpha, beta): multiplied into amp so the true
+    /// output peak equals params.amp regardless of alpha/beta.
+    amp_scale: f32,
+}
+
+/// Returns the peak value of the FOF envelope as a function of α·β.
+/// Used to normalise amplitude so `params.amp` is the true peak.
+fn fof_amax(alpha: f32, beta: f32) -> f32 {
+    let x = alpha * beta;
+    if x < 0.01 {
+        1.0
+    } else if x <= 10.0 {
+        let x = x.ln();
+        let x2 = x * x;
+        let a = -0.02677 * x2 * x - 0.2582 * x2 - 0.8238 * x - 0.9322;
+        a.exp()
+    } else {
+        0.0 // pathological case — silence
+    }
 }
 
 impl FofState {
     /// Promote a `FofParams` into an active `FofState`.
     /// Called when the time-wheel delivers the grain to the audio thread.
     pub fn spawn(params: FofParams, sample_rate: f32) -> Self {
-        let duration = params.natural_duration_samples();
-
-        let log_f_factor = if (params.f_end - params.f).abs() < 1e-6 || duration == f32::MAX {
-            1.0_f32
-        } else {
-            // f(t) = f_start · factor^t  →  factor = (f_end/f_start)^(1/duration)
-            (params.f_end / params.f).ln().div_euclid(duration).exp()
-        };
+        // f(t) = f * 2^(gliss * t / sample_rate)  →  per-sample factor = 2^(gliss / sample_rate)
+        let log_f_factor = (params.gliss * std::f32::consts::LN_2 / sample_rate).exp();
 
         // Carrier phase initialised from phi (convert radians → [0,1))
         let carrier_phase = params.phi / std::f32::consts::TAU;
         let carrier_phase = carrier_phase - carrier_phase.floor(); // wrap
+
+        let peak = fof_amax(params.alpha, params.beta);
+        let amp_scale = if peak > 0.0 { 1.0 / peak } else { 0.0 };
 
         FofState {
             params,
@@ -162,6 +179,7 @@ impl FofState {
             env_at_fo: 0.0,
             t_fo: 0,
             effective_fade_dur: params.fade_dur,
+            amp_scale,
         }
     }
 
@@ -188,28 +206,40 @@ impl FofState {
         }
     }
 
-    /// Compute one output sample and advance all accumulators.
-    /// Returns the unscaled mono sample (before panning).
-    #[inline]
-    pub fn next_sample(&mut self, sample_rate: f32) -> f32 {
+    /// Fill `buf` with mono samples for this block, advancing all accumulators.
+    ///
+    /// `buf` must be pre-zeroed; `block_start` is the absolute sample index of
+    /// `buf[0]`.  Sub-block start and mid-block Dead transitions are handled
+    /// internally — samples before the grain's start and after its death stay 0.
+    pub fn fill_block(&mut self, sample_rate: f32, block_start: u64, buf: &mut [f32]) {
         if self.phase == FofPhase::Dead {
-            return 0.0;
+            return;
         }
 
-        let env = self.envelope();
-        let sine = (self.carrier_phase * std::f32::consts::TAU).sin();
-        let out = self.params.amp * env * sine;
+        let start_offset: usize = if self.params.start_sample > block_start {
+            (self.params.start_sample - block_start) as usize
+        } else {
+            0
+        };
 
-        // ── Advance carrier ───────────────────────────────────────────────
-        self.carrier_phase += self.f_current / sample_rate;
-        self.carrier_phase -= self.carrier_phase.floor(); // wrap [0,1)
-        self.f_current *= self.log_f_factor;              // glissando step
+        let block_size = buf.len();
+        debug_assert!(start_offset < block_size);
 
-        // ── Advance time and update phase ─────────────────────────────────
-        self.t += 1;
-        self.update_phase();
+        for i in start_offset..block_size {
+            if self.phase == FofPhase::Dead {
+                break;
+            }
 
-        out
+            let env  = self.envelope();
+            let sine = (self.carrier_phase * std::f32::consts::TAU).sin();
+            buf[i]  += self.params.amp * self.amp_scale * env * sine;
+
+            self.carrier_phase += self.f_current / sample_rate;
+            self.carrier_phase -= self.carrier_phase.floor();
+            self.f_current     *= self.log_f_factor;
+            self.t += 1;
+            self.update_phase();
+        }
     }
 
     /// Trigger an external fade-out (from a kill request).

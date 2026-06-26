@@ -76,13 +76,22 @@ impl PanMode {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Compute per-channel gain weights for a FOF at the given spatial position.
+///
+/// `gains` must have length `mode.channel_count()` and be pre-zeroed.
+/// Multiply each output sample by `gains[ch]` and accumulate into the channel.
+#[inline]
+pub fn pan_gains(azm: f32, elev: f32, distance: f32, mode: PanMode, gains: &mut [f32]) {
+    pan_sample(1.0, azm, elev, distance, mode, gains);
+}
+
 /// Apply panning to a mono FOF sample, accumulating into `out`.
 ///
 /// `out` must have exactly `mode.channel_count()` channels worth of space
 /// for this sample position.  The caller provides a flat slice per-channel:
 /// `out[ch]` is the buffer for channel `ch`.
 #[inline]
-pub fn pan_sample(
+fn pan_sample(
     sample: f32,
     azm: f32,
     elev: f32,

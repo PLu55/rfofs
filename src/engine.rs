@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use slab::Slab;
 
 use crate::fof::{FofKillRequest, FofParams, FofPhase, FofState};
-use crate::pan::{pan_sample, PanMode};
+use crate::pan::{pan_gains, PanMode};
 use crate::queue::{KillQueueConsumer, TimeWheelConsumer};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -32,6 +32,18 @@ pub struct RfofsEngine {
     /// Scratch buffer for kill requests drained this block.
     kill_requests: Vec<FofKillRequest>,
 
+    /// Mono synthesis scratch (length = max_block_size). Reused across FOFs.
+    mono_buf: Vec<f32>,
+
+    /// Per-channel pan gain scratch (length = pan_mode.channel_count()).
+    gains_buf: Vec<f32>,
+
+    /// Reusable slab-key list — avoids per-block Vec allocation.
+    active_keys: Vec<usize>,
+
+    /// Reusable dead-FOF collection buffer.
+    dead_keys: Vec<(usize, u64)>,
+
     /// Absolute sample counter — incremented by block_size each block.
     sample_clock: u64,
 
@@ -47,6 +59,7 @@ impl RfofsEngine {
         sample_rate: f32,
         pan_mode: PanMode,
         initial_capacity: usize,
+        max_block_size: usize,
         wheels: Vec<TimeWheelConsumer>,
         kill_rx: KillQueueConsumer,
     ) -> Self {
@@ -57,6 +70,10 @@ impl RfofsEngine {
             id_map: HashMap::with_capacity(256),
             incoming: Vec::with_capacity(256),
             kill_requests: Vec::with_capacity(64),
+            mono_buf: vec![0.0f32; max_block_size],
+            gains_buf: vec![0.0f32; pan_mode.channel_count()],
+            active_keys: Vec::with_capacity(initial_capacity),
+            dead_keys: Vec::with_capacity(initial_capacity),
             sample_clock: 0,
             wheels,
             kill_rx,
@@ -93,57 +110,48 @@ impl RfofsEngine {
             }
         }
 
-        // ── 4. Per-sample DSP ─────────────────────────────────────────────
-        // Collect slab keys upfront to allow mutable borrow inside the loop.
-        // Slab iteration is O(capacity) not O(len) — acceptable for dense pools.
-        let keys: Vec<usize> = self.active.iter().map(|(k, _)| k).collect();
+        // ── 4. Block-level DSP ───────────────────────────────────────────────
+        if block_size > self.mono_buf.len() {
+            self.mono_buf.resize(block_size, 0.0);
+        }
 
-        // Reusable per-sample pan output scratch (stack allocation, small).
-        let n_ch = self.pan_mode.channel_count();
-        let mut pan_buf = vec![0.0f32; n_ch];
+        self.active_keys.clear();
+        self.active_keys.extend(self.active.iter().map(|(k, _)| k));
 
-        for sample_idx in 0..block_size {
-            let abs_sample = block_start + sample_idx as u64;
+        let sample_rate = self.sample_rate;
+        let pan_mode    = self.pan_mode;
+        let n_ch        = outputs.len();
 
-            for &key in &keys {
-                let fof = &mut self.active[key];
+        for &key in &self.active_keys {
+            // 4a. Zero mono scratch for this FOF.
+            let mono = &mut self.mono_buf[..block_size];
+            for x in mono.iter_mut() { *x = 0.0; }
 
-                // Sub-block accurate start: skip if not yet started.
-                if fof.params.start_sample > abs_sample {
-                    continue;
-                }
+            // 4b. Fill mono block (handles sub-block start and mid-block Dead).
+            self.active[key].fill_block(sample_rate, block_start, mono);
 
-                let mono = fof.next_sample(self.sample_rate);
+            // 4c. Compute static pan gains once per FOF.
+            for x in self.gains_buf.iter_mut() { *x = 0.0; }
+            let p = &self.active[key].params;
+            pan_gains(p.azm, p.elev, p.distance, pan_mode, &mut self.gains_buf);
 
-                // Clear pan scratch buffer.
-                for x in pan_buf.iter_mut() { *x = 0.0; }
-
-                pan_sample(
-                    mono,
-                    fof.params.azm,
-                    fof.params.elev,
-                    fof.params.distance,
-                    self.pan_mode,
-                    &mut pan_buf,
-                );
-
-                // Accumulate into output channels.
-                for (ch, &gain) in pan_buf.iter().enumerate() {
-                    if ch < outputs.len() {
-                        outputs[ch][sample_idx] += gain;
-                    }
+            // 4d. Scatter mono block into output channels.
+            let mono = &self.mono_buf[..block_size];
+            for (ch, &gain) in self.gains_buf.iter().enumerate().take(n_ch) {
+                for (out_s, &m) in outputs[ch].iter_mut().zip(mono.iter()) {
+                    *out_s += m * gain;
                 }
             }
         }
 
         // ── 5. Remove dead FOFs ───────────────────────────────────────────
-        let mut dead_keys = Vec::new(); // small, avoids borrow conflict
+        self.dead_keys.clear();
         for (key, fof) in self.active.iter() {
             if fof.phase == FofPhase::Dead {
-                dead_keys.push((key, fof.params.id));
+                self.dead_keys.push((key, fof.params.id));
             }
         }
-        for (key, id) in dead_keys {
+        for (key, id) in self.dead_keys.drain(..) {
             self.active.remove(key);
             if id != 0 {
                 self.id_map.remove(&id);

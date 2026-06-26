@@ -19,6 +19,7 @@ fn main() {
             .expect("failed to open JACK client");
 
     let sample_rate = client.sample_rate() as f32;
+    let max_block_size = client.buffer_size() as usize;
 
     // Register output ports.
     let mut out_ports: Vec<jack::Port<jack::AudioOut>> = (0..n_channels)
@@ -33,7 +34,8 @@ fn main() {
     let mut engine = RfofsEngine::new(
         sample_rate,
         pan_mode,
-        4096,          // initial FOF pool capacity
+        4096,            // initial FOF pool capacity
+        max_block_size,
         vec![wheel_rx],
         kill_rx,
     );
@@ -69,7 +71,7 @@ fn main() {
         id:           0,          // fire-and-forget
         start_sample: 4410,       // start 0.1 s from engine start (at 44100 Hz)
         f:            440.0,
-        f_end:        880.0,      // glide up one octave
+        gliss:        1.0,        // glide up one octave/sec
         phi:          0.0,
         amp:          0.5,
         alpha:        10.0,       // moderate decay
