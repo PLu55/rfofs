@@ -148,7 +148,7 @@ mod tests {
             id: 0,
             start_sample,
             f: 440.0,
-            f_end: 440.0,
+            gliss: 0.0,
             phi: 0.0,
             amp: 1.0,
             alpha: 0.001,
