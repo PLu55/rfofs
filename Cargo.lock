@@ -640,6 +640,7 @@ dependencies = [
  "log",
  "rtrb",
  "slab",
+ "sndfile",
 ]
 
 [[package]]
@@ -713,6 +714,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "sndfile"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5af4266ce8db5ac8ab182aa1739afdd6cbffc46a1fcce770ee3795dd7280ff1"
+dependencies = [
+ "lazy_static",
+ "sndfile-sys",
+]
+
+[[package]]
+name = "sndfile-sys"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3bbcd2e6363a833ce9a61c808fa46e5502af69c31d59d94ea16369228f60ed5b"
+dependencies = [
+ "libc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -764,6 +786,12 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "walkdir"

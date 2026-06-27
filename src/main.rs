@@ -1,17 +1,69 @@
-use rfofs::{PanMode, RfofsEngine};
 use rfofs::fof::FofParams;
 use rfofs::queue::{kill_queue, time_wheel};
+use rfofs::{OfflineRenderer, PanMode, RfofsEngine};
 
 fn main() {
     env_logger::init();
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(path) = args.get(1) {
+        run_offline(path);
+    } else {
+        run_jack();
+    }
+}
 
+// ── Offline mode ─────────────────────────────────────────────────────────────
+
+fn run_offline(path: &str) {
+    let sample_rate = 48_000.0f32;
+    let block_size = 512;
+    let pan_mode = PanMode::parse("stereo").expect("invalid pan mode");
+
+    let mut renderer = OfflineRenderer::open(path, sample_rate, pan_mode, block_size)
+        .expect("failed to open output file");
+
+    // Demo sequence — start_sample values are weakly monotonic.
+    // Pentatonic phrase: C4 E4 G4 C5 G4, one note every 0.2 s at 48 kHz.
+    let notes: &[(u64, f32, f32)] = &[
+        (9_600,  261.63,  0.0),   // C4 at 0.2 s,  centre
+        (19_200, 329.63, -0.4),   // E4 at 0.4 s,  left
+        (28_800, 392.00,  0.4),   // G4 at 0.6 s,  right
+        (38_400, 523.25,  0.0),   // C5 at 0.8 s,  centre
+        (48_000, 392.00, -0.4),   // G4 at 1.0 s,  left
+    ];
+
+    for &(start_sample, f, azm) in notes {
+        renderer.add_fof(FofParams {
+            id:           0,
+            start_sample,
+            f,
+            gliss:        0.0,
+            phi:          0.0,
+            amp:          0.5,
+            alpha:        0.0003,  // ~0.5 s decay (alpha * beta ≈ 0.14, within fof_amax range)
+            beta:         480.0,   // 10 ms attack at 48 kHz
+            fade_level:   0.001,
+            fade_dur:     480,
+            azm,
+            elev:         0.0,
+            distance:     1.0,
+        });
+    }
+
+    renderer.close();
+    println!("wrote {path}");
+}
+
+// ── JACK real-time mode ───────────────────────────────────────────────────────
+
+fn run_jack() {
     // ── Configuration ─────────────────────────────────────────────────────
     let pan_mode = PanMode::parse("stereo").expect("invalid pan mode");
     let n_channels = pan_mode.channel_count();
 
     // ── Queues ────────────────────────────────────────────────────────────
     let (mut wheel_tx, wheel_rx) = time_wheel(4096);
-    let (mut kill_tx, kill_rx) = kill_queue(256);
+    let (_kill_tx, kill_rx) = kill_queue(256);
 
     // ── JACK client ───────────────────────────────────────────────────────
     let (client, _status) =
@@ -74,7 +126,7 @@ fn main() {
         gliss:        1.0,        // glide up one octave/sec
         phi:          0.0,
         amp:          0.5,
-        alpha:        10.0,       // moderate decay
+        alpha:        0.0003,     // ~0.5 s decay (alpha * beta must be ≤ 10 for fof_amax)
         beta:         441.0,      // 10 ms attack at 44100 Hz
         fade_level:   0.001,
         fade_dur:     441,        // 10 ms fade-out
