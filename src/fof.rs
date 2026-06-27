@@ -31,10 +31,10 @@ pub struct FofParams {
 
     // ── Envelope ─────────────────────────────────────────────────────────────
 
-    /// Exponential decay coefficient α.  env_decay(t) = exp(−α·t).
+    /// Exponential decay coefficient α in s⁻¹.  env_decay(t) = exp(−α·t), t in seconds.
     pub alpha: f32,
 
-    /// Attack duration β in samples (half-cosine sigmoid).
+    /// Attack duration β in seconds (half-cosine sigmoid).
     pub beta: f32,
 
     // ── Natural fade-out ─────────────────────────────────────────────────────
@@ -43,8 +43,8 @@ pub struct FofParams {
     /// e.g. 0.001 ≈ −60 dB below peak.
     pub fade_level: f32,
 
-    /// Duration of the fade-out ramp in samples (linear, env → 0).
-    pub fade_dur: u32,
+    /// Duration of the fade-out ramp in seconds (linear, env → 0).
+    pub fade_dur: f32,
 
     // ── Panning ───────────────────────────────────────────────────────────────
 
@@ -59,15 +59,14 @@ pub struct FofParams {
 }
 
 impl FofParams {
-    /// Returns the expected total duration (attack + decay until fade_level)
-    /// in fractional samples.  Used to precompute the glissando rate.
+    /// Returns the expected total duration (attack + decay until fade_level) in samples.
     ///
-    /// Derived from:  exp(−α · t_end) = fade_level  →  t_end = −ln(fade_level) / α
-    pub fn natural_duration_samples(&self) -> f32 {
+    /// Derived from:  exp(−α · t_end) = fade_level  →  t_end = −ln(fade_level) / α  (seconds)
+    pub fn natural_duration_samples(&self, sample_rate: f32) -> f32 {
         if self.alpha <= 0.0 || self.fade_level <= 0.0 {
             return f32::MAX;
         }
-        -self.fade_level.ln() / self.alpha
+        -self.fade_level.ln() / self.alpha * sample_rate
     }
 }
 
@@ -79,8 +78,8 @@ pub struct FofKillRequest {
     /// Must match the `id` in `FofParams`; ignored if not found.
     pub id: u64,
 
-    /// Duration of the fade-out ramp in samples.
-    pub fade_dur: u32,
+    /// Duration of the fade-out ramp in seconds.
+    pub fade_dur: f32,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,12 +130,21 @@ pub struct FofState {
     /// `t` value at which fade-out was entered.
     pub t_fo: u32,
 
-    /// Effective fade-out duration in samples (from params or kill request).
-    pub effective_fade_dur: u32,
+    /// Effective fade-out duration in samples (converted from seconds at spawn or kill time).
+    pub effective_fade_dur: f32,
+
+    /// Sample rate stored for converting kill-request fade_dur from seconds to samples.
+    sample_rate: f32,
 
     /// Reciprocal of fof_amax(alpha, beta): multiplied into amp so the true
     /// output peak equals params.amp regardless of alpha/beta.
     amp_scale: f32,
+
+    /// Attack duration in samples: params.beta * sample_rate.
+    beta_samples: f32,
+
+    /// Per-sample decay coefficient: params.alpha / sample_rate.
+    alpha_per_sample: f32,
 }
 
 /// Returns the peak value of the FOF envelope as a function of α·β.
@@ -166,6 +174,9 @@ impl FofState {
         let carrier_phase = params.phi / std::f32::consts::TAU;
         let carrier_phase = carrier_phase - carrier_phase.floor(); // wrap
 
+        let beta_samples = params.beta * sample_rate;
+        let alpha_per_sample = params.alpha / sample_rate;
+
         let peak = fof_amax(params.alpha, params.beta);
         let amp_scale = if peak > 0.0 { 1.0 / peak } else { 0.0 };
 
@@ -178,8 +189,11 @@ impl FofState {
             t: 0,
             env_at_fo: 0.0,
             t_fo: 0,
-            effective_fade_dur: params.fade_dur,
+            effective_fade_dur: params.fade_dur * sample_rate,
+            sample_rate,
             amp_scale,
+            beta_samples,
+            alpha_per_sample,
         }
     }
 
@@ -189,16 +203,15 @@ impl FofState {
         let t = self.t as f32;
         match self.phase {
             FofPhase::Attack => {
-                let beta = self.params.beta;
-                let rise = 0.5 * (1.0 - (std::f32::consts::PI * t / beta).cos());
-                rise * (-self.params.alpha * t).exp()
+                let rise = 0.5 * (1.0 - (std::f32::consts::PI * t / self.beta_samples).cos());
+                rise * (-self.alpha_per_sample * t).exp()
             }
             FofPhase::Decay => {
-                (-self.params.alpha * t).exp()
+                (-self.alpha_per_sample * t).exp()
             }
             FofPhase::FadeOut => {
                 let elapsed = (self.t - self.t_fo) as f32;
-                let dur = self.effective_fade_dur as f32;
+                let dur = self.effective_fade_dur;
                 let frac = (1.0 - elapsed / dur).max(0.0);
                 self.env_at_fo * frac
             }
@@ -244,13 +257,13 @@ impl FofState {
 
     /// Trigger an external fade-out (from a kill request).
     /// No-op if already in FadeOut or Dead.
-    pub fn trigger_fade_out(&mut self, fade_dur: u32) {
+    pub fn trigger_fade_out(&mut self, fade_dur: f32) {
         if matches!(self.phase, FofPhase::FadeOut | FofPhase::Dead) {
             return;
         }
         self.env_at_fo = self.envelope();
         self.t_fo = self.t;
-        self.effective_fade_dur = fade_dur;
+        self.effective_fade_dur = fade_dur * self.sample_rate;
         self.phase = FofPhase::FadeOut;
     }
 
@@ -259,23 +272,22 @@ impl FofState {
     fn update_phase(&mut self) {
         match self.phase {
             FofPhase::Attack => {
-                if self.t as f32 >= self.params.beta {
+                if self.t as f32 >= self.beta_samples {
                     self.phase = FofPhase::Decay;
                 }
             }
             FofPhase::Decay => {
                 // Check natural fade-out threshold
-                let env = (-self.params.alpha * self.t as f32).exp();
+                let env = (-self.alpha_per_sample * self.t as f32).exp();
                 if env < self.params.fade_level {
                     self.env_at_fo = env;
                     self.t_fo = self.t;
-                    self.effective_fade_dur = self.params.fade_dur;
+                    self.effective_fade_dur = self.params.fade_dur * self.sample_rate;
                     self.phase = FofPhase::FadeOut;
                 }
             }
             FofPhase::FadeOut => {
-                let elapsed = self.t - self.t_fo;
-                if elapsed >= self.effective_fade_dur {
+                if (self.t - self.t_fo) as f32 >= self.effective_fade_dur {
                     self.phase = FofPhase::Dead;
                 }
             }

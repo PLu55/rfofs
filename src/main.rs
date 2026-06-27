@@ -40,10 +40,10 @@ fn run_offline(path: &str) {
             gliss:        0.0,
             phi:          0.0,
             amp:          0.5,
-            alpha:        0.0003,  // ~0.5 s decay (alpha * beta ≈ 0.14, within fof_amax range)
-            beta:         480.0,   // 10 ms attack at 48 kHz
+            alpha:        10.0,    // ~0.7 s decay (rad/s)
+            beta:         0.01,    // 10 ms attack (seconds)
             fade_level:   0.001,
-            fade_dur:     480,
+            fade_dur:     0.01,
             azm,
             elev:         0.0,
             distance:     1.0,
@@ -126,10 +126,10 @@ fn run_jack() {
         gliss:        1.0,        // glide up one octave/sec
         phi:          0.0,
         amp:          0.5,
-        alpha:        0.0003,     // ~0.5 s decay (alpha * beta must be ≤ 10 for fof_amax)
-        beta:         441.0,      // 10 ms attack at 44100 Hz
+        alpha:        10.0,        // ~0.7 s decay (rad/s)
+        beta:         0.01,       // 10 ms attack (seconds)
         fade_level:   0.001,
-        fade_dur:     441,        // 10 ms fade-out
+        fade_dur:     0.01,       // 10 ms fade-out
         azm:          0.0,
         elev:         0.0,
         distance:     1.0,
