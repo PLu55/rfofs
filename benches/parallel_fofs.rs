@@ -48,7 +48,9 @@ fn bench_enqueue(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let capacity = n.next_power_of_two();
-                    let (tx, rx) = time_wheel(capacity);
+                    // All FOFs share start_sample = 0, landing in a single
+                    // slot -> slot_capacity must cover the whole batch.
+                    let (tx, rx) = time_wheel(capacity, 4, BLOCK_SIZE as u64, capacity);
                     let params: Vec<FofParams> = (0..n).map(|_| standard_fof()).collect();
                     (tx, rx, params)
                 },
@@ -74,7 +76,9 @@ struct ComputeSetup {
 
 fn setup_compute(n_fofs: usize) -> ComputeSetup {
     let capacity = n_fofs.next_power_of_two();
-    let (mut wheel_tx, wheel_rx) = time_wheel(capacity);
+    // All FOFs share start_sample = 0, landing in a single slot ->
+    // slot_capacity must cover the whole batch.
+    let (mut wheel_tx, wheel_rx) = time_wheel(capacity, 4, BLOCK_SIZE as u64, capacity);
     let (_kill_tx, kill_rx) = kill_queue(64);
 
     for _ in 0..n_fofs {

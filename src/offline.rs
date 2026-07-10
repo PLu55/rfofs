@@ -49,7 +49,9 @@ impl OfflineRenderer {
         ))
         .from_path(path)?;
 
-        let (wheel_tx, wheel_rx) = time_wheel(4096);
+        // D = 256 samples (typical block size), N = 256 slots -> horizon ~=
+        // 65.5k samples (~1.4 s @48kHz), M = 64 simultaneous onsets per slot.
+        let (wheel_tx, wheel_rx) = time_wheel(4096, 256, 256, 64);
         let (_kill_tx, kill_rx) = kill_queue(256);
 
         let engine = RfofsEngine::new(

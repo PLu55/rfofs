@@ -63,7 +63,10 @@ fn setup(n_fofs: usize) -> Setup {
     start_times.sort_unstable();
 
     let capacity = n_fofs.next_power_of_two();
-    let (mut wheel_tx, wheel_rx) = time_wheel(capacity);
+    // start_times can span far beyond a small wheel's horizon; entries
+    // beyond it are deferred in the ring buffer, not dropped, so a modest
+    // N*D horizon (~65.5k samples @ D=256, N=256) is fine here.
+    let (mut wheel_tx, wheel_rx) = time_wheel(capacity, 256, 256, capacity);
     let (_kill_tx, kill_rx) = kill_queue(64);
 
     for &s in &start_times {
