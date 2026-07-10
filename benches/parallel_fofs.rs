@@ -16,27 +16,28 @@ use rfofs::{
 };
 
 const SAMPLE_RATE: f32 = 48000.0;
-const BLOCK_SIZE: usize = 512;
+const BLOCK_SIZE: usize = 256;
 
 fn standard_fof() -> FofParams {
     FofParams {
         id: 0,
         start_sample: 0,
-        f: 440.0,
+        f: 1000.0,
         gliss: 0.0,
         phi: 0.0,
         amp: 1.0,
-        alpha: 20.0,
-        beta: 0.01,
+        alpha: 13.5,
+        beta: 0.1,
         fade_level: 0.001,
-        fade_dur: 0.01,
+        fade_dur: 0.005,
         azm: 0.0,
         elev: 0.0,
-        distance: 1.0,
+        distance: 0.0
     }
 }
 
-const FOF_SIZES: &[usize] = &[100, 500, 1000, 2000];
+// const FOF_SIZES: &[usize] = &[100, 500, 1000, 2000];
+const FOF_SIZES: &[usize] = &[100];
 
 /// Time spent pushing N simultaneous-start FOFs onto the time-wheel.
 fn bench_enqueue(c: &mut Criterion) {
@@ -88,7 +89,7 @@ fn setup_compute(n_fofs: usize) -> ComputeSetup {
 
     let engine = RfofsEngine::new(
         SAMPLE_RATE,
-        PanMode::Stereo,
+        PanMode::Mono,
         n_fofs,
         BLOCK_SIZE,
         vec![wheel_rx],
