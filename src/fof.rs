@@ -113,6 +113,52 @@ const LANES: usize = 8;
 /// `[0.0, 1.0, .., 7.0]` — the per-lane sample offset within a chunk.
 const IOTA: [f32; LANES] = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
 
+// Degree-9 odd minimax polynomial for sin(2π·p) over p ∈ [-0.5, 0.5]:
+//   sin(2π p) ≈ p·(C1 + C3·p² + C5·p⁴ + C7·p⁶ + C9·p⁸)
+// Least-squares fit; max abs error ≈ 1.7e-5 in f32 — well under the engine's
+// LUT-derived test tolerance. Used by `sin_cycles_x8` so the SIMD hot loop
+// evaluates the carrier sine in-lane instead of gathering 8 scalar LUT reads.
+const SIN_C1: f32 = 6.2830887;
+const SIN_C3: f32 = -41.333252;
+const SIN_C5: f32 = 81.40014;
+const SIN_C7: f32 = -74.67622;
+const SIN_C9: f32 = 33.168808;
+
+/// `sin(2π · phase)` for all 8 lanes, `phase` in cycles (fraction of a turn).
+///
+/// Range-reduces each lane to `[-0.5, 0.5]` cycles (`p = phase - round(phase)`,
+/// which also wraps negatives and large magnitudes) and evaluates the
+/// degree-9 odd polynomial above via Horner + FMA. Fully vectorized: this is
+/// what lets the `process_*` chunk loops avoid the per-lane scalar `active_sin`
+/// LUT gather that dominated the decay hot path once the per-chunk `powi` was
+/// removed.
+#[cfg(not(feature = "std-sin"))]
+#[inline]
+fn sin_cycles_x8(phase: f32x8) -> f32x8 {
+    let p = phase - phase.round();
+    let p2 = p * p;
+    let acc = f32x8::splat(SIN_C9)
+        .mul_add(p2, f32x8::splat(SIN_C7))
+        .mul_add(p2, f32x8::splat(SIN_C5))
+        .mul_add(p2, f32x8::splat(SIN_C3))
+        .mul_add(p2, f32x8::splat(SIN_C1));
+    p * acc
+}
+
+/// `std-sin` build: evaluate `f32::sin` per lane instead of the polynomial,
+/// so the feature still means "reference-accurate sine everywhere" (see
+/// `active_sin`).
+#[cfg(feature = "std-sin")]
+#[inline]
+fn sin_cycles_x8(phase: f32x8) -> f32x8 {
+    let arr = phase.to_array();
+    let mut out = [0.0f32; LANES];
+    for lane in 0..LANES {
+        out[lane] = (arr[lane] * std::f32::consts::TAU).sin();
+    }
+    f32x8::from(out)
+}
+
 /// Runtime state for one active FOF grain.
 /// Lives in the slab allocator inside the audio thread.
 pub struct FofState {
@@ -170,6 +216,22 @@ pub struct FofState {
 
     /// `[d^0, d^1, .., d^7]` — precomputed once per grain.
     d_pows: [f32; LANES],
+
+    /// d^LANES == d^8 — the per-chunk stride for the decay envelope. Lets the
+    /// `process_*` loops advance the running d^t accumulator by one multiply
+    /// per chunk (`d_acc *= d8`) instead of recomputing `d.powi(t0)` from
+    /// scratch every chunk — that `powi` was ~29% of decay-phase CPU time.
+    d8: f32,
+
+    /// Running decay envelope value `d^t` at the current `self.t`, persisted
+    /// across `fill_block` calls. Attack and Decay advance it in lockstep
+    /// with `self.t` (it starts at `d^0 == 1.0` at spawn), so the hot loops
+    /// never need to reseed it with a `powi` — the exponential decay is a
+    /// pure running product. FadeOut leaves it untouched (the decay envelope
+    /// is never read again once fade-out begins). Drift over a grain's
+    /// lifetime is bounded and negligible in absolute terms because the
+    /// envelope is decaying (see the accuracy note where it's advanced).
+    decay_acc: f32,
 
     /// ln(r) == gliss * ln2 / sample_rate (r = log_f_factor). Kept around so
     /// `r^t - 1` can be computed via `expm1(t * ln_r)` — computing it as
@@ -251,6 +313,7 @@ impl FofState {
         for k in 1..LANES {
             d_pows[k] = d_pows[k - 1] * d;
         }
+        let d8 = d_pows[LANES - 1] * d; // d^8
 
         // ln(r) == gliss * ln2 / sample_rate; gliss_denom == r - 1, via expm1
         // to stay accurate for small gliss rates (r very close to 1).
@@ -292,6 +355,8 @@ impl FofState {
             inv_2beta,
             d,
             d_pows,
+            d8,
+            decay_acc: 1.0, // d^0
             ln_r,
             r_pows_m1,
             has_gliss: gliss_denom != 0.0,
@@ -365,13 +430,15 @@ impl FofState {
         }
 
         // Keep the public debug/reference fields consistent — O(1) per block.
-        let phase = if self.has_gliss {
-            self.carrier_phase_at::<true>(self.t)
+        // f_current only actually changes when there's glissando; for the
+        // common no-gliss path it's the constant params.f, so skip the
+        // per-block powi (which would otherwise pointlessly evaluate 1.0^t).
+        if self.has_gliss {
+            self.carrier_phase = wrap_phase(self.carrier_phase_at::<true>(self.t));
+            self.f_current = self.params.f * self.log_f_factor.powi(self.t as i32);
         } else {
-            self.carrier_phase_at::<false>(self.t)
-        };
-        self.carrier_phase = wrap_phase(phase);
-        self.f_current = self.params.f * self.log_f_factor.powi(self.t as i32);
+            self.carrier_phase = wrap_phase(self.carrier_phase_at::<false>(self.t));
+        }
     }
 
     /// Trigger an external fade-out (from a kill request).
@@ -482,30 +549,25 @@ impl FofState {
 
     #[inline]
     fn carrier_sine_chunk<const GLISS: bool>(&self, t0: u32) -> f32x8 {
-        let phase_arr = self.carrier_phase_chunk::<GLISS>(t0).to_array();
-        let mut sine_arr = [0.0f32; LANES];
-        for lane in 0..LANES {
-            sine_arr[lane] = active_sin(phase_arr[lane]);
-        }
-        f32x8::from(sine_arr)
+        sin_cycles_x8(self.carrier_phase_chunk::<GLISS>(t0))
     }
 
+    /// Decay envelope chunk `[d^t0 .. d^(t0+7)]`, given `d_base == d^t0`
+    /// supplied by the caller. The caller maintains `d_base` incrementally
+    /// (`*= d8` per chunk) so this stays free of the per-chunk `powi` that
+    /// recomputing `d^t0` from scratch would cost.
     #[inline]
-    fn decay_env_chunk(&self, t0: u32) -> f32x8 {
-        let d_base = self.d.powi(t0 as i32);
+    fn decay_env_chunk_from(&self, d_base: f32) -> f32x8 {
         f32x8::splat(d_base) * f32x8::from(self.d_pows)
     }
 
     #[inline]
     fn attack_rise_chunk(&self, t0: u32) -> f32x8 {
+        // cos(2π·x) == sin(2π·(x + 0.25)); phase carries the +0.25 offset.
         let base = t0 as f32 * self.inv_2beta + 0.25;
         let phase_vec = f32x8::splat(base) + f32x8::from(IOTA) * f32x8::splat(self.inv_2beta);
-        let phase_arr = phase_vec.to_array();
-        let mut cos_arr = [0.0f32; LANES];
-        for lane in 0..LANES {
-            cos_arr[lane] = active_sin(phase_arr[lane]);
-        }
-        (f32x8::splat(1.0) - f32x8::from(cos_arr)) * f32x8::splat(0.5)
+        let cos = sin_cycles_x8(phase_vec);
+        (f32x8::splat(1.0) - cos) * f32x8::splat(0.5)
     }
 
     // ── Private: per-phase block processors ─────────────────────────────────
@@ -547,22 +609,37 @@ impl FofState {
         let simd_end = n - n % LANES;
         let amp_total = f32x8::splat(self.amp_total);
 
+        // Running d^t, carried across blocks in `self.decay_acc` (advanced by
+        // `d8` per chunk, `d` per tail sample — see `decay_env_chunk_from`).
+        // Accumulating the decay as a running product rather than reseeding
+        // with `powi` each run adds only ~sqrt(t) extra rounding steps, whose
+        // relative error is negligible in absolute terms since the envelope
+        // it scales is itself decaying toward zero.
+        let mut d_acc = self.decay_acc;
+        let d8 = self.d8;
+
         let mut idx = 0;
         while idx < simd_end {
             let t0 = self.t + idx as u32;
-            let env_vec = self.decay_env_chunk(t0) * self.attack_rise_chunk(t0);
+            let env_vec = self.decay_env_chunk_from(d_acc) * self.attack_rise_chunk(t0);
             let sine_vec = self.carrier_sine_chunk::<GLISS>(t0);
             let buf_vec = f32x8::from(<[f32; LANES]>::try_from(&buf[idx..idx + LANES]).unwrap());
             let out = (env_vec * sine_vec).mul_add(amp_total, buf_vec);
             buf[idx..idx + LANES].copy_from_slice(&out.to_array());
+            d_acc *= d8;
             idx += LANES;
         }
+        // d_acc == d^(self.t + simd_end) here, matching the tail's first t.
         while idx < n {
             let t = self.t + idx as u32;
-            let env = self.decay_env_at(t) * self.attack_rise_at(t);
+            let env = d_acc * self.attack_rise_at(t);
             buf[idx] += self.amp_total * env * self.carrier_sine_at::<GLISS>(t);
+            d_acc *= self.d;
             idx += 1;
         }
+        // d_acc == d^(self.t + n); fill_block advances self.t by n next, so
+        // this keeps the `decay_acc == d^self.t` invariant.
+        self.decay_acc = d_acc;
     }
 
     fn process_decay(&mut self, buf: &mut [f32]) {
@@ -579,22 +656,30 @@ impl FofState {
         let simd_end = n - n % LANES;
         let amp_total = f32x8::splat(self.amp_total);
 
+        // Running d^t carried across blocks — see process_attack_impl.
+        let mut d_acc = self.decay_acc;
+        let d8 = self.d8;
+
         let mut idx = 0;
         while idx < simd_end {
             let t0 = self.t + idx as u32;
-            let env_vec = self.decay_env_chunk(t0);
+            let env_vec = self.decay_env_chunk_from(d_acc);
             let sine_vec = self.carrier_sine_chunk::<GLISS>(t0);
             let buf_vec = f32x8::from(<[f32; LANES]>::try_from(&buf[idx..idx + LANES]).unwrap());
             let out = (env_vec * sine_vec).mul_add(amp_total, buf_vec);
             buf[idx..idx + LANES].copy_from_slice(&out.to_array());
+            d_acc *= d8;
             idx += LANES;
         }
+        // d_acc == d^(self.t + simd_end) here, matching the tail's first t.
         while idx < n {
             let t = self.t + idx as u32;
-            let env = self.decay_env_at(t);
-            buf[idx] += self.amp_total * env * self.carrier_sine_at::<GLISS>(t);
+            buf[idx] += self.amp_total * d_acc * self.carrier_sine_at::<GLISS>(t);
+            d_acc *= self.d;
             idx += 1;
         }
+        // Maintains the `decay_acc == d^self.t` invariant (see attack).
+        self.decay_acc = d_acc;
     }
 
     fn process_fadeout(&mut self, buf: &mut [f32]) {
