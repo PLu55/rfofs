@@ -27,7 +27,16 @@ slab = "0.4"
 # Logging (non-allocating on hot path via log facade)
 log = "0.4"
 env_logger = "0.11"
- 
+
+# Portable SIMD for the FOF synthesis hot path
+wide = "1.5"
+
+[features]
+# Use f32::sin (via active_sin in src/fastsin.rs) instead of the LUT for the
+# FOF carrier/attack sine — for isolating how much of the synthesis cost is
+# the LUT vs. everything else, or chasing a suspected quantization artifact.
+std-sin = []
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
@@ -37,6 +46,10 @@ harness = false
 
 [[bench]]
 name = "parallel_fofs"
+harness = false
+
+[[bench]]
+name = "fast_sin"
 harness = false
 
 [profile.release]
