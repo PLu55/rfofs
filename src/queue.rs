@@ -154,7 +154,7 @@ mod tests {
             alpha: 0.001,
             beta: 100.0,
             fade_level: 0.001,
-            fade_dur: 50,
+            fade_dur: 50.0,
             azm: 0.0,
             elev: 0.0,
             distance: 1.0,
@@ -162,7 +162,7 @@ mod tests {
     }
 
     fn kill(id: u64) -> FofKillRequest {
-        FofKillRequest { id, fade_dur: 100 }
+        FofKillRequest { id, fade_dur: 100.0 }
     }
 
     // ── TimeWheelProducer ────────────────────────────────────────────────────
