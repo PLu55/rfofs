@@ -4,6 +4,7 @@ pub mod fof;
 pub mod offline;
 pub mod pan;
 pub mod queue;
+pub mod shm;
 
 pub use engine::RfofsEngine;
 pub use fastsin::{active_sin, fast_sin, fast_sin_quarter};

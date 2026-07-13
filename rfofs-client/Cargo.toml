@@ -1,0 +1,12 @@
+[package]
+name = "rfofs-client"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "rfofs_client"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rfofs = { path = ".." }
+libc = "0.2"

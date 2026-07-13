@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use crate::fof::{FofParams, FofKillRequest};
 
@@ -18,6 +20,18 @@ use crate::fof::{FofParams, FofKillRequest};
 ///
 /// All `N` slots are preallocated to capacity `M` at construction so that
 /// `schedule` never allocates on the hot (real-time) path.
+/// Why [`Wheel::schedule`] rejected an event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejectReason {
+    /// `deadline` was already behind the wheel's clock.
+    TooLate,
+    /// `deadline` is at or beyond the wheel's current horizon — too far in
+    /// the future for the wheel to accept yet.
+    TooEarly,
+    /// The event's target slot is already at capacity `M`.
+    SlotFull,
+}
+
 struct Wheel<T> {
     slots: Vec<Vec<T>>,
     slot_duration: u64,
@@ -44,6 +58,13 @@ impl<T> Wheel<T> {
         self.slots.len()
     }
 
+    /// Total number of events currently sitting in the wheel's slots,
+    /// scheduled but not yet fired. O(`n_slots`); only called once per
+    /// audio block (from `drain_block_safe`), so this is negligible.
+    fn len(&self) -> usize {
+        self.slots.iter().map(Vec::len).sum()
+    }
+
     /// Start-of-interval time of the slot currently at the read head.
     fn wheel_time(&self) -> u64 {
         self.slot_index * self.slot_duration
@@ -59,21 +80,21 @@ impl<T> Wheel<T> {
     /// Rejects (returning the event back) if `deadline` is already behind
     /// the wheel's clock, at or beyond the horizon, or its target slot is
     /// already at capacity `M`.
-    fn schedule(&mut self, event: T, deadline: u64) -> Result<(), T> {
+    fn schedule(&mut self, event: T, deadline: u64) -> Result<(), (T, RejectReason)> {
         let now = self.wheel_time();
         if deadline < now {
-            return Err(event); // overdue — ignored
+            return Err((event, RejectReason::TooLate)); // overdue — ignored
         }
         let offset = deadline - now;
         if offset >= self.horizon() {
-            return Err(event); // beyond horizon — ignored
+            return Err((event, RejectReason::TooEarly)); // beyond horizon — ignored
         }
         let slot_delta = offset / self.slot_duration;
         let n_slots = self.n_slots() as u64;
         let idx = ((self.slot_index + slot_delta) % n_slots) as usize;
         let slot = &mut self.slots[idx];
         if slot.len() >= self.slot_capacity {
-            return Err(event); // slot full — ignored
+            return Err((event, RejectReason::SlotFull)); // slot full — ignored
         }
         slot.push(event);
         Ok(())
@@ -89,6 +110,31 @@ impl<T> Wheel<T> {
             self.slot_index += 1;
         }
     }
+}
+
+/// Lock-free counters tracking [`TimeWheelConsumer`] admission/scheduling
+/// outcomes, plus current wheel occupancy. `#[repr(C)]` so it can be
+/// embedded directly inside a shared-memory segment (see `shm.rs`) and read
+/// by an external process without any locking or copying — the audio
+/// thread updates these in place from [`TimeWheelConsumer::drain_block_safe`].
+#[repr(C)]
+#[derive(Default)]
+pub struct QueueStats {
+    /// Count of events rejected because their deadline had already passed
+    /// (see [`RejectReason::TooLate`]).
+    pub too_late: AtomicU64,
+    /// Count of events rejected because their deadline was beyond the
+    /// wheel's current horizon (see [`RejectReason::TooEarly`]). In
+    /// practice this stays at 0 via [`TimeWheelConsumer::drain_block_safe`]:
+    /// its `admit_before` pre-filter already excludes anything beyond
+    /// horizon before `Wheel::schedule` is ever called, so this branch is
+    /// only reachable if something calls `Wheel::schedule` directly.
+    pub too_early: AtomicU64,
+    /// Count of events rejected because their target slot was already at
+    /// capacity `M` (see [`RejectReason::SlotFull`]).
+    pub slot_full: AtomicU64,
+    /// Number of events currently scheduled in the wheel, not yet fired.
+    pub queue_size: AtomicU64,
 }
 
 /// Producer handle for a [`Wheel`]-backed FOF schedule.
@@ -113,6 +159,12 @@ pub struct TimeWheelProducer {
 pub struct TimeWheelConsumer {
     rx: Consumer<FofParams>,
     wheel: Wheel<FofParams>,
+    /// Optional stats sink, attached post-construction via [`attach_stats`]
+    /// so [`time_wheel`]'s signature (and every existing caller/test) stays
+    /// unchanged for callers that don't need stats tracking.
+    ///
+    /// [`attach_stats`]: TimeWheelConsumer::attach_stats
+    stats: Option<&'static QueueStats>,
 }
 
 /// Create a matched producer/consumer pair.
@@ -130,7 +182,7 @@ pub fn time_wheel(
     let (tx, rx) = RingBuffer::new(ingress_capacity);
     (
         TimeWheelProducer { tx },
-        TimeWheelConsumer { rx, wheel: Wheel::new(n_slots, slot_duration, slot_capacity) },
+        TimeWheelConsumer { rx, wheel: Wheel::new(n_slots, slot_duration, slot_capacity), stats: None },
     )
 }
 
@@ -147,6 +199,16 @@ impl TimeWheelProducer {
 }
 
 impl TimeWheelConsumer {
+    /// Attach a stats sink — subsequent [`drain_block_safe`] calls will
+    /// record admission/rejection counts and current queue occupancy into
+    /// it. Typically points at a `QueueStats` embedded in a shared-memory
+    /// segment (see `shm.rs`) so an external process can read it live.
+    ///
+    /// [`drain_block_safe`]: TimeWheelConsumer::drain_block_safe
+    pub fn attach_stats(&mut self, stats: &'static QueueStats) {
+        self.stats = Some(stats);
+    }
+
     /// Admit ready entries from the ring buffer into the wheel, then
     /// advance the wheel's clock to `block_start + block_size`, appending
     /// every FOF fired along the way to `out`.
@@ -164,7 +226,16 @@ impl TimeWheelConsumer {
             let params = *chunk.as_slices().0.first().unwrap();
             if params.start_sample < admit_before {
                 chunk.commit_all(); // consume
-                let _ = self.wheel.schedule(params, params.start_sample);
+                if let Err((_, reason)) = self.wheel.schedule(params, params.start_sample) {
+                    if let Some(stats) = self.stats {
+                        let counter = match reason {
+                            RejectReason::TooLate => &stats.too_late,
+                            RejectReason::TooEarly => &stats.too_early,
+                            RejectReason::SlotFull => &stats.slot_full,
+                        };
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             } else {
                 // Not yet within the admission window — leave in buffer.
                 // Dropping chunk without committing returns the slot.
@@ -173,6 +244,9 @@ impl TimeWheelConsumer {
         }
         let block_end = block_start + block_size;
         self.wheel.advance(block_end, out);
+        if let Some(stats) = self.stats {
+            stats.queue_size.store(self.wheel.len() as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -284,8 +358,9 @@ mod tests {
     #[test]
     fn wheel_rejects_event_beyond_horizon() {
         let mut w: Wheel<u64> = Wheel::new(4, 10, 8); // horizon = 40
-        let err = w.schedule(1, 40).unwrap_err();
-        assert_eq!(err, 1);
+        let (event, reason) = w.schedule(1, 40).unwrap_err();
+        assert_eq!(event, 1);
+        assert_eq!(reason, RejectReason::TooEarly);
     }
 
     #[test]
@@ -299,8 +374,9 @@ mod tests {
         let mut w: Wheel<u64> = Wheel::new(4, 10, 8);
         let mut out = Vec::new();
         w.advance(15, &mut out); // wheel_time now 10
-        let err = w.schedule(1, 5).unwrap_err();
-        assert_eq!(err, 1);
+        let (event, reason) = w.schedule(1, 5).unwrap_err();
+        assert_eq!(event, 1);
+        assert_eq!(reason, RejectReason::TooLate);
     }
 
     #[test]
@@ -308,8 +384,9 @@ mod tests {
         let mut w: Wheel<u64> = Wheel::new(4, 10, 2);
         w.schedule(1, 1).unwrap();
         w.schedule(2, 2).unwrap();
-        let err = w.schedule(3, 3).unwrap_err();
-        assert_eq!(err, 3);
+        let (event, reason) = w.schedule(3, 3).unwrap_err();
+        assert_eq!(event, 3);
+        assert_eq!(reason, RejectReason::SlotFull);
 
         let mut out = Vec::new();
         w.advance(10, &mut out);
@@ -327,6 +404,20 @@ mod tests {
         w.schedule(1, 95).unwrap(); // slot 9 % 4 == 1: [90, 100)
         w.advance(100, &mut out);
         assert_eq!(out, vec![1]);
+    }
+
+    #[test]
+    fn wheel_len_tracks_scheduled_and_fired_events() {
+        let mut w: Wheel<u64> = Wheel::new(4, 10, 8);
+        assert_eq!(w.len(), 0);
+        w.schedule(1, 5).unwrap();
+        w.schedule(2, 15).unwrap();
+        assert_eq!(w.len(), 2);
+
+        let mut out = Vec::new();
+        w.advance(10, &mut out); // fires slot 0 (event 1)
+        assert_eq!(out, vec![1]);
+        assert_eq!(w.len(), 1);
     }
 
     // ── TimeWheelProducer ────────────────────────────────────────────────────
@@ -408,6 +499,36 @@ mod tests {
             out.iter().map(|p| p.start_sample).collect::<Vec<_>>(),
             [128, 192]
         );
+    }
+
+    #[test]
+    fn drain_block_safe_tracks_queue_size_when_stats_attached() {
+        let (mut tx, mut rx) = time_wheel(8, 8, 16, 8); // horizon = 128
+        let stats: &'static QueueStats = Box::leak(Box::default());
+        rx.attach_stats(stats);
+        tx.push(params(0)).unwrap();
+        tx.push(params(64)).unwrap();
+
+        let mut out = Vec::new();
+        rx.drain_block_safe(0, 16, &mut out); // only params(0) fires this block
+        assert_eq!(out.len(), 1);
+        assert_eq!(stats.queue_size.load(Ordering::Relaxed), 1); // params(64) still pending
+    }
+
+    #[test]
+    fn drain_block_safe_counts_slot_full_rejections_when_stats_attached() {
+        let (mut tx, mut rx) = time_wheel(16, 4, 10, 2); // slot_capacity = 2
+        let stats: &'static QueueStats = Box::leak(Box::default());
+        rx.attach_stats(stats);
+        // Three events land in the same slot ([0,10)); only 2 fit.
+        tx.push(params(1)).unwrap();
+        tx.push(params(2)).unwrap();
+        tx.push(params(3)).unwrap();
+
+        let mut out = Vec::new();
+        rx.drain_block_safe(0, 10, &mut out);
+        assert_eq!(out.len(), 2);
+        assert_eq!(stats.slot_full.load(Ordering::Relaxed), 1);
     }
 
     #[test]

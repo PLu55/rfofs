@@ -6,6 +6,7 @@
 /// - `id == 0`  → fire-and-forget; not tracked in the id map.
 /// - `id != 0`  → caller-assigned stable id; eligible for targeted kill.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct FofParams {
     /// Caller-assigned id. 0 = fire-and-forget.
     pub id: u64,
@@ -74,6 +75,7 @@ impl FofParams {
 
 /// Request to trigger an early fade-out on a tracked (id != 0) FOF.
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct FofKillRequest {
     /// Must match the `id` in `FofParams`; ignored if not found.
     pub id: u64,

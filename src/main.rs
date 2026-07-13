@@ -1,5 +1,6 @@
 use rfofs::fof::FofParams;
 use rfofs::queue::{kill_queue, time_wheel};
+use rfofs::shm::ServerShm;
 use rfofs::{OfflineRenderer, PanMode, RfofsEngine};
 
 fn main() {
@@ -64,8 +65,17 @@ fn run_jack() {
     // ── Queues ────────────────────────────────────────────────────────────
     // D = 256 samples (typical block size), N = 256 slots -> horizon ~= 65.5k
     // samples (~1.4 s @48kHz), M = 64 simultaneous onsets per slot.
-    let (mut wheel_tx, wheel_rx) = time_wheel(4096, 256, 256, 64);
-    let (_kill_tx, kill_rx) = kill_queue(256);
+    let (mut wheel_tx, mut wheel_rx) = time_wheel(4096, 256, 256, 64);
+    let (mut kill_tx, kill_rx) = kill_queue(256);
+
+    // ── Control-plane shared memory ──────────────────────────────────────
+    // Lets an external process (e.g. Racket via the rfofs-client cdylib)
+    // submit FOFs/kills and read live stats. See rfofs::shm for the
+    // cross-process ring buffer this wraps; wheel_rx's stats sink writes
+    // directly into the shared segment, so external readers see them live
+    // with no separate sync step.
+    let shm = ServerShm::create().expect("failed to create control-plane shm segment");
+    wheel_rx.attach_stats(&shm.block().stats);
 
     // ── JACK client ───────────────────────────────────────────────────────
     let (client, _status) =
@@ -138,6 +148,30 @@ fn run_jack() {
     };
 
     wheel_tx.push(params).expect("queue full");
+
+    // ── Control-plane bridging thread ────────────────────────────────────
+    // Not real-time: forwards shared-memory requests from external clients
+    // into the same TimeWheelProducer/KillQueueProducer the demo push above
+    // uses. A short sleep when both rings are empty avoids busy-spinning a
+    // whole core — FOF onsets are scheduled via start_sample ahead of time,
+    // so sub-millisecond latency here is a non-issue.
+    std::thread::spawn(move || {
+        let block = shm.block();
+        loop {
+            let mut did_work = false;
+            if let Some(p) = block.try_pop_fof() {
+                let _ = wheel_tx.push(p);
+                did_work = true;
+            }
+            if let Some(k) = block.try_pop_kill() {
+                let _ = kill_tx.push(k);
+                did_work = true;
+            }
+            if !did_work {
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+        }
+    });
 
     println!("rfofs running — press Enter to quit");
     let mut input = String::new();

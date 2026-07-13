@@ -643,11 +643,20 @@ dependencies = [
  "criterion",
  "env_logger",
  "jack",
+ "libc",
  "log",
  "rtrb",
  "slab",
  "sndfile",
  "wide",
+]
+
+[[package]]
+name = "rfofs-client"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rfofs",
 ]
 
 [[package]]

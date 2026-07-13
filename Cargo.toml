@@ -1,8 +1,11 @@
+[workspace]
+members = [".", "rfofs-client"]
+
 [package]
 name = "rfofs"
 version = "0.1.0"
 edition = "2024"
- 
+
 [[bin]]
 name = "rfofs"
 path = "src/main.rs"
@@ -30,6 +33,9 @@ env_logger = "0.11"
 
 # Portable SIMD for the FOF synthesis hot path
 wide = "1.5"
+
+# POSIX shared memory (shm_open/mmap) for the cross-process control-plane
+libc = "0.2"
 
 [features]
 # Use f32::sin (via active_sin in src/fastsin.rs) instead of the LUT for the
