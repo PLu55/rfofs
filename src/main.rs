@@ -1,63 +1,18 @@
-use rfofs::fof::FofParams;
 use rfofs::queue::{kill_queue, time_wheel};
 use rfofs::shm::ServerShm;
-use rfofs::{OfflineRenderer, PanMode, RfofsEngine};
+use rfofs::{PanMode, RfofsEngine};
 
+/// `rfofs`'s online server: a JACK client whose FOF onsets and kills are
+/// driven entirely by external processes (e.g. Racket via the
+/// `rfofs-client` cdylib) over the shared-memory control plane in
+/// `rfofs::shm`. See `rfofs-client/examples/shm_client_smoke.rs` for a
+/// worked example of connecting and issuing calls.
+///
+/// (Offline WAV rendering via `OfflineRenderer` no longer has a CLI mode
+/// here — see `tests/offline_render.rs`, which exercises it directly.)
 fn main() {
     env_logger::init();
-    let args: Vec<String> = std::env::args().collect();
-    if let Some(path) = args.get(1) {
-        run_offline(path);
-    } else {
-        run_jack();
-    }
-}
 
-// ── Offline mode ─────────────────────────────────────────────────────────────
-
-fn run_offline(path: &str) {
-    let sample_rate = 48_000.0f32;
-    let block_size = 512;
-    let pan_mode = PanMode::parse("stereo").expect("invalid pan mode");
-
-    let mut renderer = OfflineRenderer::open(path, sample_rate, pan_mode, block_size)
-        .expect("failed to open output file");
-
-    // Demo sequence — start_sample values are weakly monotonic.
-    // Pentatonic phrase: C4 E4 G4 C5 G4, one note every 0.2 s at 48 kHz.
-    let notes: &[(u64, f32, f32)] = &[
-        (9_600,  261.63,  0.0),   // C4 at 0.2 s,  centre
-        (19_200, 329.63, -0.4),   // E4 at 0.4 s,  left
-        (28_800, 392.00,  0.4),   // G4 at 0.6 s,  right
-        (38_400, 523.25,  0.0),   // C5 at 0.8 s,  centre
-        (48_000, 392.00, -0.4),   // G4 at 1.0 s,  left
-    ];
-
-    for &(start_sample, f, azm) in notes {
-        renderer.add_fof(FofParams {
-            id:           0,
-            start_sample,
-            f,
-            gliss:        0.0,
-            phi:          0.0,
-            amp:          0.5,
-            alpha:        10.0,    // ~0.7 s decay (rad/s)
-            beta:         0.01,    // 10 ms attack (seconds)
-            fade_level:   0.001,
-            fade_dur:     0.01,
-            azm,
-            elev:         0.0,
-            distance:     1.0,
-        });
-    }
-
-    renderer.close();
-    println!("wrote {path}");
-}
-
-// ── JACK real-time mode ───────────────────────────────────────────────────────
-
-fn run_jack() {
     // ── Configuration ─────────────────────────────────────────────────────
     let pan_mode = PanMode::parse("stereo").expect("invalid pan mode");
     let n_channels = pan_mode.channel_count();
@@ -130,31 +85,12 @@ fn run_jack() {
     let _active_client = client.activate_async((), process)
         .expect("failed to activate JACK client");
 
-    // ── Demo: enqueue a single test FOF from the main thread ─────────────
-    let params = FofParams {
-        id:           0,          // fire-and-forget
-        start_sample: 4410,       // start 0.1 s from engine start (at 44100 Hz)
-        f:            440.0,
-        gliss:        1.0,        // glide up one octave/sec
-        phi:          0.0,
-        amp:          0.5,
-        alpha:        10.0,        // ~0.7 s decay (rad/s)
-        beta:         0.01,       // 10 ms attack (seconds)
-        fade_level:   0.001,
-        fade_dur:     0.01,       // 10 ms fade-out
-        azm:          0.0,
-        elev:         0.0,
-        distance:     1.0,
-    };
-
-    wheel_tx.push(params).expect("queue full");
-
     // ── Control-plane bridging thread ────────────────────────────────────
     // Not real-time: forwards shared-memory requests from external clients
-    // into the same TimeWheelProducer/KillQueueProducer the demo push above
-    // uses. A short sleep when both rings are empty avoids busy-spinning a
-    // whole core — FOF onsets are scheduled via start_sample ahead of time,
-    // so sub-millisecond latency here is a non-issue.
+    // into the same TimeWheelProducer/KillQueueProducer the engine above was
+    // constructed with. A short sleep when both rings are empty avoids
+    // busy-spinning a whole core — FOF onsets are scheduled via start_sample
+    // ahead of time, so sub-millisecond latency here is a non-issue.
     std::thread::spawn(move || {
         let block = shm.block();
         loop {
@@ -173,7 +109,7 @@ fn run_jack() {
         }
     });
 
-    println!("rfofs running — press Enter to quit");
+    println!("rfofs server running — connect with rfofs-client, press Enter to quit");
     let mut input = String::new();
     std::io::stdin().read_line(&mut input).ok();
 }
