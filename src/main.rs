@@ -1,3 +1,4 @@
+use rfofs::clock::ClockMode;
 use rfofs::queue::{kill_queue, time_wheel};
 use rfofs::shm::ServerShm;
 use rfofs::{PanMode, RfofsEngine};
@@ -10,27 +11,37 @@ use rfofs::{PanMode, RfofsEngine};
 ///
 /// (Offline WAV rendering via `OfflineRenderer` no longer has a CLI mode
 /// here — see `tests/offline_render.rs`, which exercises it directly.)
+///
+/// Pass `--clock-mode <frame-time|transport|1|2>` to pick which JACK time
+/// source drives the engine's sample clock (see `rfofs::clock`); defaults
+/// to `frame-time`.
+fn parse_clock_mode_arg() -> ClockMode {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--clock-mode=") {
+            return ClockMode::parse(value).expect("invalid --clock-mode value");
+        }
+        if arg == "--clock-mode" {
+            let value = args.next().expect("--clock-mode requires a value");
+            return ClockMode::parse(&value).expect("invalid --clock-mode value");
+        }
+    }
+    ClockMode::default()
+}
+
 fn main() {
     env_logger::init();
 
     // ── Configuration ─────────────────────────────────────────────────────
     let pan_mode = PanMode::parse("stereo").expect("invalid pan mode");
     let n_channels = pan_mode.channel_count();
+    let clock_mode = parse_clock_mode_arg();
 
     // ── Queues ────────────────────────────────────────────────────────────
     // D = 256 samples (typical block size), N = 256 slots -> horizon ~= 65.5k
     // samples (~1.4 s @48kHz), M = 64 simultaneous onsets per slot.
     let (mut wheel_tx, mut wheel_rx) = time_wheel(4096, 256, 256, 64);
     let (mut kill_tx, kill_rx) = kill_queue(256);
-
-    // ── Control-plane shared memory ──────────────────────────────────────
-    // Lets an external process (e.g. Racket via the rfofs-client cdylib)
-    // submit FOFs/kills and read live stats. See rfofs::shm for the
-    // cross-process ring buffer this wraps; wheel_rx's stats sink writes
-    // directly into the shared segment, so external readers see them live
-    // with no separate sync step.
-    let shm = ServerShm::create().expect("failed to create control-plane shm segment");
-    wheel_rx.attach_stats(&shm.block().stats);
 
     // ── JACK client ───────────────────────────────────────────────────────
     let (client, _status) =
@@ -39,6 +50,19 @@ fn main() {
 
     let sample_rate = client.sample_rate() as f32;
     let max_block_size = client.buffer_size() as usize;
+
+    // ── Control-plane shared memory ──────────────────────────────────────
+    // Lets an external process (e.g. Racket via the rfofs-client cdylib)
+    // submit FOFs/kills and read live stats. See rfofs::shm for the
+    // cross-process ring buffer this wraps; wheel_rx's stats sink writes
+    // directly into the shared segment, so external readers see them live
+    // with no separate sync step. Published alongside the actual sample
+    // rate/buffer size JACK just handed us, so clients don't have to assume
+    // fixed values.
+    let shm = ServerShm::create(sample_rate, max_block_size as u32, clock_mode.as_u32())
+        .expect("failed to create control-plane shm segment");
+    let shm_block = shm.block();
+    wheel_rx.attach_stats(&shm_block.stats);
 
     // Register output ports.
     let mut out_ports: Vec<jack::Port<jack::AudioOut>> = (0..n_channels)
@@ -61,8 +85,23 @@ fn main() {
 
     // ── Process callback ──────────────────────────────────────────────────
     let process = jack::ClosureProcessHandler::new(
-        move |_client, ps: &jack::ProcessScope| -> jack::Control {
+        move |client: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
             let block_size = ps.n_frames() as usize;
+
+            // Resync the engine's sample clock to the selected JACK time
+            // source before processing this block — see `rfofs::clock`.
+            // `JackTransport` falls back to the engine's own running clock
+            // if the query fails (e.g. client shutting down), rather than
+            // stalling the callback.
+            let block_start = match clock_mode {
+                ClockMode::JackFrameTime => client.frame_time() as u64,
+                ClockMode::JackTransport => client
+                    .transport()
+                    .query()
+                    .map(|tp| tp.pos.frame() as u64)
+                    .unwrap_or_else(|_| engine.sample_clock()),
+            };
+            engine.set_sample_clock(block_start);
 
             // Get mutable slices for each output channel.
             let mut slices: Vec<&mut [f32]> = out_ports
@@ -76,6 +115,7 @@ fn main() {
             }
 
             engine.process_block(&mut slices, block_size);
+            shm_block.set_current_sample(engine.sample_clock());
 
             jack::Control::Continue
         },

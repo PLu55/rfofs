@@ -11,6 +11,15 @@
 use rfofs::fof::{FofKillRequest, FofParams};
 use rfofs::shm::ClientShm;
 
+/// Drive the server's sample clock from `jack_frame_time()` (the default).
+/// Mirrors `rfofs::clock::RFOFS_CLOCK_JACK_FRAME_TIME` — kept as a separate
+/// constant here since C-ABI consumers of this cdylib don't link against
+/// the `rfofs` crate directly.
+pub const RFOFS_CLOCK_JACK_FRAME_TIME: u32 = rfofs::clock::RFOFS_CLOCK_JACK_FRAME_TIME;
+/// Drive the server's sample clock from `jack_transport_query()`. Mirrors
+/// `rfofs::clock::RFOFS_CLOCK_JACK_TRANSPORT`.
+pub const RFOFS_CLOCK_JACK_TRANSPORT: u32 = rfofs::clock::RFOFS_CLOCK_JACK_TRANSPORT;
+
 /// Opaque handle returned by [`rfofs_connect`].
 pub struct ClientHandle(ClientShm);
 
@@ -33,6 +42,42 @@ pub extern "C" fn rfofs_connect() -> *mut ClientHandle {
         Ok(shm) => Box::into_raw(Box::new(ClientHandle(shm))),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+/// The audio server's sample rate, in Hz. Returns 0.0 if `handle` is null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rfofs_sample_rate(handle: *mut ClientHandle) -> f32 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return 0.0 };
+    handle.0.block().sample_rate()
+}
+
+/// The audio server's nominal buffer size, in frames. Individual process
+/// callbacks may report fewer frames than this; it's the value to plan
+/// around (e.g. for scheduling headroom). Returns 0 if `handle` is null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rfofs_block_size(handle: *mut ClientHandle) -> u32 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return 0 };
+    handle.0.block().block_size()
+}
+
+/// The clock mode the server was started with — `RFOFS_CLOCK_JACK_FRAME_TIME`
+/// or `RFOFS_CLOCK_JACK_TRANSPORT` (see those constants). Returns 0 if
+/// `handle` is null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rfofs_clock_mode(handle: *mut ClientHandle) -> u32 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return 0 };
+    handle.0.block().clock_mode()
+}
+
+/// The engine's current absolute sample clock. Callers must submit
+/// `start_sample` values at or beyond this (plus some future headroom to
+/// absorb the bridging thread's poll latency) — `start_sample` is an
+/// absolute sample count since the server started, not relative to the
+/// client's connection time. Returns 0 if `handle` is null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rfofs_current_sample(handle: *mut ClientHandle) -> u64 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return 0 };
+    handle.0.block().current_sample()
 }
 
 /// Release a handle obtained from [`rfofs_connect`]. `handle` must not be

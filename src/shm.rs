@@ -107,12 +107,64 @@ pub struct SharedControlBlock {
     version: AtomicU32,
     /// Set to 1 once the creator has finished initializing the segment.
     ready: AtomicU32,
+    /// The audio server's actual sample rate (from JACK/PipeWire), stored as
+    /// `f32::to_bits`. Written once by `ServerShm::create` before `ready` is
+    /// set, then never mutated — reads need no synchronization beyond the
+    /// `ready` handshake itself.
+    sample_rate_bits: AtomicU32,
+    /// The audio server's configured buffer size (frames per callback), as
+    /// reported by JACK/PipeWire at connect time. Individual callbacks may
+    /// still report a smaller `n_frames` (`RfofsEngine::process_block`
+    /// handles that already); this is the nominal/maximum value clients
+    /// should plan around. Written once, same as `sample_rate_bits`.
+    block_size: AtomicU32,
+    /// Which JACK time source drives `sample_clock` each block — one of
+    /// `crate::clock::RFOFS_CLOCK_JACK_FRAME_TIME`/`RFOFS_CLOCK_JACK_TRANSPORT`.
+    /// Selected at server startup (CLI flag) and never mutated afterwards,
+    /// same handshake as `sample_rate_bits`/`block_size`.
+    clock_mode: AtomicU32,
+    /// The engine's current absolute sample clock (start of the next block
+    /// to be processed), updated once per audio block from the process
+    /// callback. Clients need this to submit `start_sample` values that
+    /// land in the future relative to the *server's* clock — the wheel
+    /// rejects anything already behind it as [`crate::queue::RejectReason::TooLate`].
+    current_sample: AtomicU64,
     fof_ring: Ring<FofParams, FOF_CAP>,
     kill_ring: Ring<FofKillRequest, KILL_CAP>,
     pub stats: QueueStats,
 }
 
 impl SharedControlBlock {
+    /// The audio server's sample rate, in Hz.
+    pub fn sample_rate(&self) -> f32 {
+        f32::from_bits(self.sample_rate_bits.load(Ordering::Relaxed))
+    }
+
+    /// The audio server's nominal buffer size, in frames.
+    pub fn block_size(&self) -> u32 {
+        self.block_size.load(Ordering::Relaxed)
+    }
+
+    /// The active clock mode — `crate::clock::RFOFS_CLOCK_JACK_FRAME_TIME`
+    /// or `RFOFS_CLOCK_JACK_TRANSPORT`.
+    pub fn clock_mode(&self) -> u32 {
+        self.clock_mode.load(Ordering::Relaxed)
+    }
+
+    /// The engine's current absolute sample clock. Clients should submit
+    /// `start_sample` as this value plus some future headroom (enough to
+    /// absorb the bridging thread's poll latency), not an absolute count
+    /// from their own notion of time zero.
+    pub fn current_sample(&self) -> u64 {
+        self.current_sample.load(Ordering::Relaxed)
+    }
+
+    /// Publish the engine's current sample clock. Called once per audio
+    /// block from the process callback (server side only).
+    pub fn set_current_sample(&self, sample: u64) {
+        self.current_sample.store(sample, Ordering::Relaxed);
+    }
+
     /// Submit a new FOF request. Called by the client (Racket) side.
     pub fn try_push_fof(&self, params: FofParams) -> Result<(), FofParams> {
         self.fof_ring.try_push(params)
@@ -163,7 +215,15 @@ impl ServerShm {
     /// Tries `O_CREAT|O_EXCL` first; if a stale segment from a previous
     /// crashed run already exists (`EEXIST`), unlinks it and retries once
     /// rather than failing outright.
-    pub fn create() -> io::Result<Self> {
+    ///
+    /// `sample_rate`/`block_size` are the values the caller's audio server
+    /// (JACK/PipeWire) is actually running at — they're published into the
+    /// segment so attaching clients (e.g. `rfofs-client`) can read them back
+    /// instead of assuming a fixed rate. `clock_mode` is the JACK time
+    /// source (`crate::clock::RFOFS_CLOCK_JACK_FRAME_TIME`/
+    /// `RFOFS_CLOCK_JACK_TRANSPORT`) selected for this run, published the
+    /// same way.
+    pub fn create(sample_rate: f32, block_size: u32, clock_mode: u32) -> io::Result<Self> {
         let name = shm_name_cstring();
         let mut fd = unsafe {
             libc::shm_open(
@@ -216,6 +276,9 @@ impl ServerShm {
         unsafe {
             (*ptr).magic.store(MAGIC, Ordering::Relaxed);
             (*ptr).version.store(VERSION, Ordering::Relaxed);
+            (*ptr).sample_rate_bits.store(sample_rate.to_bits(), Ordering::Relaxed);
+            (*ptr).block_size.store(block_size, Ordering::Relaxed);
+            (*ptr).clock_mode.store(clock_mode, Ordering::Relaxed);
             (*ptr).ready.store(1, Ordering::Release);
         }
 

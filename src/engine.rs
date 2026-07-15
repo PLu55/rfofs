@@ -172,6 +172,18 @@ impl RfofsEngine {
         self.sample_clock
     }
 
+    /// Override the sample clock ahead of the next `process_block` call.
+    ///
+    /// Used by the JACK-mode caller to resync `sample_clock` to an external
+    /// JACK time source (`jack_frame_time()` or the transport position)
+    /// each cycle instead of relying purely on internal `block_size`
+    /// accumulation — see `src/clock.rs`. Not used by `OfflineRenderer`,
+    /// which has no JACK clock to sync to and relies on the free-running
+    /// accumulation `process_block` already does.
+    pub fn set_sample_clock(&mut self, sample: u64) {
+        self.sample_clock = sample;
+    }
+
     // ── Private helpers ───────────────────────────────────────────────────────
 
     fn drain_wheels(&mut self, block_start: u64, block_size: u64) {

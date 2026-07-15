@@ -11,7 +11,11 @@
 //! Run it *without* rfofs running first to confirm rfofs_connect() fails
 //! gracefully (returns null) instead of crashing.
 
-use rfofs_client::{rfofs_add_fof, rfofs_connect, rfofs_disconnect, rfofs_get_stats, rfofs_kill, RfofsStats};
+use rfofs_client::{
+    rfofs_add_fof, rfofs_block_size, rfofs_clock_mode, rfofs_connect, rfofs_current_sample,
+    rfofs_disconnect, rfofs_get_stats, rfofs_kill, rfofs_sample_rate, RfofsStats,
+    RFOFS_CLOCK_JACK_FRAME_TIME, RFOFS_CLOCK_JACK_TRANSPORT,
+};
 
 fn main() {
     let handle = rfofs_connect();
@@ -20,12 +24,33 @@ fn main() {
         std::process::exit(1);
     }
     println!("connected to running rfofs");
+    let sample_rate = unsafe { rfofs_sample_rate(handle) };
+    let block_size = unsafe { rfofs_block_size(handle) };
+    let clock_mode = unsafe { rfofs_clock_mode(handle) };
+    let clock_mode_name = match clock_mode {
+        RFOFS_CLOCK_JACK_FRAME_TIME => "jack-frame-time",
+        RFOFS_CLOCK_JACK_TRANSPORT => "jack-transport",
+        _ => "unknown",
+    };
+    println!(
+        "server sample_rate={sample_rate} block_size={block_size} clock_mode={clock_mode} ({clock_mode_name})"
+    );
+
+    // start_sample is an absolute sample count on the *server's* clock, not
+    // relative to when this client connects — the server has typically been
+    // running for a while already, so submitting start_sample=0 lands the
+    // FOF in the wheel long after that deadline has passed (rejected as
+    // too_late). Anchor off the server's live clock instead, with enough
+    // headroom (~0.2s) to absorb the bridging thread's poll latency.
+    let now = unsafe { rfofs_current_sample(handle) };
+    let headroom = (sample_rate * 0.2) as u64;
+    let start_sample = now + headroom;
 
     // Fire-and-forget FOF, audible ~0.2s from now if routed to an output.
     let rc = unsafe {
         rfofs_add_fof(
             handle, 0, /* id */
-            0,         /* start_sample: bridging thread admits it whenever it lands */
+            start_sample,
             440.0, 0.0, 0.0, 0.5, 10.0, 0.01, 0.001, 0.01, 0.0, 0.0, 1.0,
         )
     };
@@ -34,7 +59,7 @@ fn main() {
     // Tracked FOF (id = 42) immediately followed by a kill request.
     let rc = unsafe {
         rfofs_add_fof(
-            handle, 42, 0, 220.0, 0.0, 0.0, 0.5, 2.0, 0.01, 0.001, 0.01, 0.0, 0.0, 1.0,
+            handle, 42, start_sample, 220.0, 0.0, 0.0, 0.5, 2.0, 0.01, 0.001, 0.01, 0.0, 0.0, 1.0,
         )
     };
     println!("rfofs_add_fof (id=42) -> {rc}");
