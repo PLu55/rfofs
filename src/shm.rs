@@ -35,6 +35,11 @@ const VERSION: u32 = 1;
 const FOF_CAP: usize = 4096; // mirrors main.rs's existing wheel ingress_capacity
 const KILL_CAP: usize = 256; // mirrors main.rs's existing kill_queue capacity
 pub const SHM_NAME: &str = "/rfofs_ctl";
+/// Overrides the shared-memory segment name (`SHM_NAME`) when set, on both
+/// the server and client side. Lets tests point a throwaway `rfofs` instance
+/// at a private segment instead of `/rfofs_ctl`, so they don't steal the
+/// control plane out from under a real, already-running `rfofs` process.
+pub const SHM_NAME_ENV: &str = "RFOFS_SHM_NAME";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cross-process SPSC ring buffer
@@ -187,7 +192,8 @@ impl SharedControlBlock {
 }
 
 fn shm_name_cstring() -> CString {
-    CString::new(SHM_NAME).expect("SHM_NAME must not contain interior NUL bytes")
+    let name = std::env::var(SHM_NAME_ENV).unwrap_or_else(|_| SHM_NAME.to_string());
+    CString::new(name).expect("RFOFS_SHM_NAME must not contain interior NUL bytes")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
