@@ -655,7 +655,6 @@ dependencies = [
 name = "rfofs-client"
 version = "0.1.0"
 dependencies = [
- "libc",
  "rfofs",
 ]
 
