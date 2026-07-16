@@ -231,7 +231,7 @@ fn main() {
         WriterResult { sum_sq, frame_count }
     });
 
-    let process = jack::ClosureProcessHandler::new(
+    let process = jack::contrib::ClosureProcessHandler::new(
         move |_: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
             let slices: Vec<&[f32]> = in_ports.iter().map(|p| p.as_slice(ps)).collect();
             let n_frames = ps.n_frames() as usize;

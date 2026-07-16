@@ -84,7 +84,7 @@ fn main() {
     );
 
     // ── Process callback ──────────────────────────────────────────────────
-    let process = jack::ClosureProcessHandler::new(
+    let process = jack::contrib::ClosureProcessHandler::new(
         move |client: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
             let block_size = ps.n_frames() as usize;
 
