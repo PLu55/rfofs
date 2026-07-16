@@ -125,7 +125,7 @@ impl<T> Wheel<T> {
         let steps = (target_index - self.slot_index).min(n_slots);
         for i in 0..steps {
             let idx = ((self.slot_index + i) % n_slots) as usize;
-            out.extend(self.slots[idx].drain(..));
+            out.append(&mut self.slots[idx]);
         }
         self.slot_index = target_index;
     }
@@ -245,15 +245,15 @@ impl TimeWheelConsumer {
             let params = *chunk.as_slices().0.first().unwrap();
             if params.start_sample < admit_before {
                 chunk.commit_all(); // consume
-                if let Err((_, reason)) = self.wheel.schedule(params, params.start_sample) {
-                    if let Some(stats) = self.stats {
-                        let counter = match reason {
-                            RejectReason::TooLate => &stats.too_late,
-                            RejectReason::TooEarly => &stats.too_early,
-                            RejectReason::SlotFull => &stats.slot_full,
-                        };
-                        counter.fetch_add(1, Ordering::Relaxed);
-                    }
+                if let Err((_, reason)) = self.wheel.schedule(params, params.start_sample)
+                    && let Some(stats) = self.stats
+                {
+                    let counter = match reason {
+                        RejectReason::TooLate => &stats.too_late,
+                        RejectReason::TooEarly => &stats.too_early,
+                        RejectReason::SlotFull => &stats.slot_full,
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
                 // Not yet within the admission window — leave in buffer.

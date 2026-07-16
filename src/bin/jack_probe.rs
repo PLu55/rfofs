@@ -222,11 +222,11 @@ fn main() {
                 }
             }
         }
-        if chunk_len > 0 {
-            if let Some(snd) = snd.as_mut() {
-                <SndFile as SndFileIO<f32>>::write_from_slice(snd, &chunk[..chunk_len])
-                    .expect("sndfile write failed");
-            }
+        if chunk_len > 0
+            && let Some(snd) = snd.as_mut()
+        {
+            <SndFile as SndFileIO<f32>>::write_from_slice(snd, &chunk[..chunk_len])
+                .expect("sndfile write failed");
         }
         WriterResult { sum_sq, frame_count }
     });

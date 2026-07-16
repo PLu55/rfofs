@@ -45,6 +45,10 @@ pub extern "C" fn rfofs_connect() -> *mut ClientHandle {
 }
 
 /// The audio server's sample rate, in Hz. Returns 0.0 if `handle` is null.
+///
+/// # Safety
+/// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
+/// that hasn't yet been passed to [`rfofs_disconnect`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rfofs_sample_rate(handle: *mut ClientHandle) -> f32 {
     let Some(handle) = (unsafe { handle.as_ref() }) else { return 0.0 };
@@ -54,6 +58,10 @@ pub unsafe extern "C" fn rfofs_sample_rate(handle: *mut ClientHandle) -> f32 {
 /// The audio server's nominal buffer size, in frames. Individual process
 /// callbacks may report fewer frames than this; it's the value to plan
 /// around (e.g. for scheduling headroom). Returns 0 if `handle` is null.
+///
+/// # Safety
+/// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
+/// that hasn't yet been passed to [`rfofs_disconnect`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rfofs_block_size(handle: *mut ClientHandle) -> u32 {
     let Some(handle) = (unsafe { handle.as_ref() }) else { return 0 };
@@ -63,6 +71,10 @@ pub unsafe extern "C" fn rfofs_block_size(handle: *mut ClientHandle) -> u32 {
 /// The clock mode the server was started with — `RFOFS_CLOCK_JACK_FRAME_TIME`
 /// or `RFOFS_CLOCK_JACK_TRANSPORT` (see those constants). Returns 0 if
 /// `handle` is null.
+///
+/// # Safety
+/// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
+/// that hasn't yet been passed to [`rfofs_disconnect`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rfofs_clock_mode(handle: *mut ClientHandle) -> u32 {
     let Some(handle) = (unsafe { handle.as_ref() }) else { return 0 };
@@ -74,6 +86,10 @@ pub unsafe extern "C" fn rfofs_clock_mode(handle: *mut ClientHandle) -> u32 {
 /// absorb the bridging thread's poll latency) — `start_sample` is an
 /// absolute sample count since the server started, not relative to the
 /// client's connection time. Returns 0 if `handle` is null.
+///
+/// # Safety
+/// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
+/// that hasn't yet been passed to [`rfofs_disconnect`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rfofs_current_sample(handle: *mut ClientHandle) -> u64 {
     let Some(handle) = (unsafe { handle.as_ref() }) else { return 0 };
@@ -82,6 +98,10 @@ pub unsafe extern "C" fn rfofs_current_sample(handle: *mut ClientHandle) -> u64 
 
 /// Release a handle obtained from [`rfofs_connect`]. `handle` must not be
 /// used again after this call. A null `handle` is a no-op.
+///
+/// # Safety
+/// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
+/// that hasn't already been passed to `rfofs_disconnect` (no double-free).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rfofs_disconnect(handle: *mut ClientHandle) {
     if handle.is_null() {
@@ -97,6 +117,10 @@ pub unsafe extern "C" fn rfofs_disconnect(handle: *mut ClientHandle) {
 /// Returns 0 on success, -1 if `handle` is null, -2 if the shared request
 /// ring is full (the caller is submitting faster than rfofs can drain it —
 /// retry later).
+///
+/// # Safety
+/// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
+/// that hasn't yet been passed to [`rfofs_disconnect`].
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rfofs_add_fof(
@@ -142,6 +166,10 @@ pub unsafe extern "C" fn rfofs_add_fof(
 ///
 /// Returns 0 on success, -1 if `handle` is null, -2 if the shared kill ring
 /// is full.
+///
+/// # Safety
+/// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
+/// that hasn't yet been passed to [`rfofs_disconnect`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rfofs_kill(handle: *mut ClientHandle, id: u64, fade_dur: f32) -> i32 {
     let Some(handle) = (unsafe { handle.as_ref() }) else { return -1 };
@@ -154,6 +182,11 @@ pub unsafe extern "C" fn rfofs_kill(handle: *mut ClientHandle, id: u64, fade_dur
 /// Read a live snapshot of the queue stats into `*out`.
 ///
 /// Returns 0 on success, -1 if `handle` or `out` is null.
+///
+/// # Safety
+/// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
+/// that hasn't yet been passed to [`rfofs_disconnect`]. `out` must be null
+/// or a valid, properly aligned pointer, writable for a whole `RfofsStats`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rfofs_get_stats(handle: *mut ClientHandle, out: *mut RfofsStats) -> i32 {
     let Some(handle) = (unsafe { handle.as_ref() }) else { return -1 };

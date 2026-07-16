@@ -15,8 +15,9 @@ pub const RFOFS_CLOCK_JACK_TRANSPORT: u32 = 2;
 
 /// Which JACK time source supplies `RfofsEngine`'s `sample_clock` each
 /// block. See the module-level docs for what each mode means.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ClockMode {
+    #[default]
     JackFrameTime,
     JackTransport,
 }
@@ -49,12 +50,6 @@ impl ClockMode {
             "transport" | "jack-transport" => Some(ClockMode::JackTransport),
             _ => s.parse::<u32>().ok().and_then(Self::from_u32),
         }
-    }
-}
-
-impl Default for ClockMode {
-    fn default() -> Self {
-        ClockMode::JackFrameTime
     }
 }
 

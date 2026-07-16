@@ -826,14 +826,13 @@ mod tests {
             } else {
                 0
             };
-            let block_size = buf.len();
-            for i in start_offset..block_size {
+            for sample in &mut buf[start_offset..] {
                 if self.phase == FofPhase::Dead {
                     break;
                 }
                 let env = self.envelope();
                 let sine = (self.carrier_phase * std::f32::consts::TAU).sin();
-                buf[i] += self.params.amp * self.amp_scale * env * sine;
+                *sample += self.params.amp * self.amp_scale * env * sine;
 
                 self.carrier_phase += self.f_current / sample_rate;
                 self.carrier_phase -= self.carrier_phase.floor();
