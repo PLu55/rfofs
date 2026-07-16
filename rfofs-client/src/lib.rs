@@ -68,9 +68,11 @@ pub unsafe extern "C" fn rfofs_block_size(handle: *mut ClientHandle) -> u32 {
     handle.0.block().block_size()
 }
 
-/// The clock mode the server was started with — `RFOFS_CLOCK_JACK_FRAME_TIME`
-/// or `RFOFS_CLOCK_JACK_TRANSPORT` (see those constants). Returns 0 if
-/// `handle` is null.
+/// The server's currently active clock mode — `RFOFS_CLOCK_JACK_FRAME_TIME`
+/// or `RFOFS_CLOCK_JACK_TRANSPORT` (see those constants). This is whatever
+/// the server was started with, or a later value set by any client via
+/// [`rfofs_set_clock_mode`] — it is not fixed for the server's lifetime.
+/// Returns 0 if `handle` is null.
 ///
 /// # Safety
 /// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
@@ -79,6 +81,32 @@ pub unsafe extern "C" fn rfofs_block_size(handle: *mut ClientHandle) -> u32 {
 pub unsafe extern "C" fn rfofs_clock_mode(handle: *mut ClientHandle) -> u32 {
     let Some(handle) = (unsafe { handle.as_ref() }) else { return 0 };
     handle.0.block().clock_mode()
+}
+
+/// Switch which JACK time source drives the server's sample clock. Takes
+/// effect on the server's next process block after the write is observed —
+/// there is no explicit acknowledgment, poll [`rfofs_clock_mode`] if you
+/// need to confirm it landed.
+///
+/// `mode` must be `RFOFS_CLOCK_JACK_FRAME_TIME` or `RFOFS_CLOCK_JACK_TRANSPORT`.
+///
+/// Returns 0 on success, -1 if `handle` is null, -2 if `mode` isn't one of
+/// the known constants (the previous mode is left in place).
+///
+/// Caution: switching to a source reporting a *smaller* sample count than
+/// the one currently active (e.g. away from frame-time, which only grows,
+/// to a transport that's stopped or was just relocated) can silently stall
+/// new FOF admission until the new source's value grows back past where
+/// the server's scheduler had already reached. Switching to a
+/// larger-valued source is always safe.
+///
+/// # Safety
+/// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
+/// that hasn't yet been passed to [`rfofs_disconnect`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rfofs_set_clock_mode(handle: *mut ClientHandle, mode: u32) -> i32 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return -1 };
+    if handle.0.block().set_clock_mode(mode) { 0 } else { -2 }
 }
 
 /// The engine's current absolute sample clock. Callers must submit

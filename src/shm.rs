@@ -125,8 +125,11 @@ pub struct SharedControlBlock {
     block_size: AtomicU32,
     /// Which JACK time source drives `sample_clock` each block — one of
     /// `crate::clock::RFOFS_CLOCK_JACK_FRAME_TIME`/`RFOFS_CLOCK_JACK_TRANSPORT`.
-    /// Selected at server startup (CLI flag) and never mutated afterwards,
-    /// same handshake as `sample_rate_bits`/`block_size`.
+    /// Initialized from the server's `--clock-mode` CLI flag at startup
+    /// (same handshake as `sample_rate_bits`/`block_size`), but unlike those
+    /// two, live-mutable afterwards: a client can switch it via
+    /// [`SharedControlBlock::set_clock_mode`], and the server's process
+    /// callback re-reads it every block rather than caching the CLI value.
     clock_mode: AtomicU32,
     /// The engine's current absolute sample clock (start of the next block
     /// to be processed), updated once per audio block from the process
@@ -151,9 +154,36 @@ impl SharedControlBlock {
     }
 
     /// The active clock mode — `crate::clock::RFOFS_CLOCK_JACK_FRAME_TIME`
-    /// or `RFOFS_CLOCK_JACK_TRANSPORT`.
+    /// or `RFOFS_CLOCK_JACK_TRANSPORT`. May change at any time if a client
+    /// calls [`SharedControlBlock::set_clock_mode`].
     pub fn clock_mode(&self) -> u32 {
         self.clock_mode.load(Ordering::Relaxed)
+    }
+
+    /// Switch which JACK time source drives the server's sample clock.
+    /// Called by the client (Racket, via `rfofs-client`) side; the server's
+    /// process callback re-reads `clock_mode()` every block, so this takes
+    /// effect on the next block after the store is observed.
+    ///
+    /// `mode` must be `crate::clock::RFOFS_CLOCK_JACK_FRAME_TIME` or
+    /// `RFOFS_CLOCK_JACK_TRANSPORT`; anything else is rejected (`false`)
+    /// without touching the stored value, so a bad request can't leave the
+    /// server unable to resolve a sample clock.
+    ///
+    /// Caution: switching to a source whose reported sample count is
+    /// *smaller* than the one currently in effect (e.g. frame-time, which
+    /// only grows, down to a transport that's stopped or was just
+    /// relocated) can silently stall new FOF admission — the timing wheel's
+    /// clock is monotonic-only (see `Wheel::advance` in `queue.rs`), so
+    /// deadlines computed off the new, smaller clock look already-past
+    /// until it naturally grows back past where the wheel had already
+    /// reached. Switching to a *larger*-valued source is always safe.
+    pub fn set_clock_mode(&self, mode: u32) -> bool {
+        if crate::clock::ClockMode::from_u32(mode).is_none() {
+            return false;
+        }
+        self.clock_mode.store(mode, Ordering::Relaxed);
+        true
     }
 
     /// The engine's current absolute sample clock. Clients should submit

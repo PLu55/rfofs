@@ -104,8 +104,16 @@ fn wait_for_new_ports(
 /// `&["--clock-mode", "transport"]`); `roll_transport` additionally starts
 /// the shared JACK transport once the server is up (required for
 /// `--clock-mode transport`'s sample clock to advance at all) and stops it
-/// again on return/panic via `StopTransportOnDrop`.
-fn run_fof_smoke_test(extra_args: &[&str], roll_transport: bool) -> Vec<f32> {
+/// again on return/panic via `StopTransportOnDrop`. `switch_clock_mode_to`,
+/// if set, calls `SharedControlBlock::set_clock_mode` right after attaching
+/// — used to prove a *live* client-issued switch (as opposed to the
+/// `--clock-mode` startup flag) actually redirects the server's per-block
+/// sample clock source.
+fn run_fof_smoke_test(
+    extra_args: &[&str],
+    roll_transport: bool,
+    switch_clock_mode_to: Option<u32>,
+) -> Vec<f32> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let _serial = serial_guard();
 
@@ -152,6 +160,14 @@ fn run_fof_smoke_test(extra_args: &[&str], roll_transport: bool) -> Vec<f32> {
 
     let client_shm = ClientShm::attach().expect("failed to attach to rfofs control plane");
     let sample_rate = client_shm.block().sample_rate();
+
+    if let Some(mode) = switch_clock_mode_to {
+        assert!(
+            client_shm.block().set_clock_mode(mode),
+            "set_clock_mode should accept a known clock-mode constant"
+        );
+        assert_eq!(client_shm.block().clock_mode(), mode);
+    }
 
     // Only stops transport (shared, system-wide state) once we actually
     // started it — an unconditional guard would stop it even for the
@@ -260,12 +276,70 @@ fn assert_silence_then_onset(samples: &[f32]) {
 
 #[test]
 fn fof_onset_is_audible_on_jack_output() {
-    let samples = run_fof_smoke_test(&[], false);
+    let samples = run_fof_smoke_test(&[], false, None);
     assert_silence_then_onset(&samples);
 }
 
 #[test]
 fn fof_onset_is_audible_with_transport_clock_mode() {
-    let samples = run_fof_smoke_test(&["--clock-mode", "transport"], true);
+    let samples = run_fof_smoke_test(&["--clock-mode", "transport"], true, None);
     assert_silence_then_onset(&samples);
+}
+
+#[test]
+fn fof_onset_is_audible_after_live_clock_mode_switch() {
+    // Server starts in transport mode (frozen — the harness never rolls
+    // transport here) and a client switches it to frame-time at runtime,
+    // proving `set_clock_mode` actually redirects the server's per-block
+    // sample clock, not just the shared flag a reader sees.
+    //
+    // Deliberately a *forward* jump (transport's frame count, likely small
+    // or 0, to frame-time's — jack_frame_time() counts from when the JACK
+    // server itself started, so it's typically already far larger). The
+    // reverse direction is a known gap: the timing wheel's clock is
+    // monotonic-only (see `Wheel::advance` in src/queue.rs), so jumping to a
+    // *smaller* reported clock leaves new deadlines looking already-past
+    // until the new source's value grows back past where the wheel had
+    // already reached — the same underlying issue as the still-open
+    // "Handle transport jumps" item in dev_notes.md.
+    let samples = run_fof_smoke_test(
+        &["--clock-mode", "transport"],
+        false,
+        Some(rfofs::clock::RFOFS_CLOCK_JACK_FRAME_TIME),
+    );
+    assert_silence_then_onset(&samples);
+}
+
+#[test]
+fn set_clock_mode_rejects_unknown_values() {
+    let _serial = serial_guard();
+    let shm_name = format!("/rfofs_ctl_test_reject_{}", std::process::id());
+    let _shm_cleanup = ShmCleanup(CString::new(shm_name.clone()).unwrap());
+    // SAFETY: serialized by `serial_guard()` above.
+    unsafe { std::env::set_var(SHM_NAME_ENV, &shm_name) };
+
+    let _server = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_rfofs"))
+            .env(SHM_NAME_ENV, &shm_name)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rfofs server"),
+    );
+
+    let client_shm = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match ClientShm::attach() {
+                Ok(shm) => break shm,
+                Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => panic!("failed to attach to rfofs control plane: {e:?}"),
+            }
+        }
+    };
+
+    let before = client_shm.block().clock_mode();
+    assert!(!client_shm.block().set_clock_mode(0xDEAD_BEEF));
+    assert_eq!(client_shm.block().clock_mode(), before, "rejected write must not mutate stored mode");
 }

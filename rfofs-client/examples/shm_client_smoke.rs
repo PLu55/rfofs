@@ -13,8 +13,8 @@
 
 use rfofs_client::{
     rfofs_add_fof, rfofs_block_size, rfofs_clock_mode, rfofs_connect, rfofs_current_sample,
-    rfofs_disconnect, rfofs_get_stats, rfofs_kill, rfofs_sample_rate, RfofsStats,
-    RFOFS_CLOCK_JACK_FRAME_TIME, RFOFS_CLOCK_JACK_TRANSPORT,
+    rfofs_disconnect, rfofs_get_stats, rfofs_kill, rfofs_sample_rate, rfofs_set_clock_mode,
+    RfofsStats, RFOFS_CLOCK_JACK_FRAME_TIME, RFOFS_CLOCK_JACK_TRANSPORT,
 };
 
 fn main() {
@@ -35,6 +35,19 @@ fn main() {
     println!(
         "server sample_rate={sample_rate} block_size={block_size} clock_mode={clock_mode} ({clock_mode_name})"
     );
+
+    // Flip the clock mode and back, to demonstrate a client can switch it
+    // live (not just read it back) — see rfofs::shm::SharedControlBlock::
+    // set_clock_mode. Takes effect on the server's next process block.
+    let other_mode = if clock_mode == RFOFS_CLOCK_JACK_FRAME_TIME {
+        RFOFS_CLOCK_JACK_TRANSPORT
+    } else {
+        RFOFS_CLOCK_JACK_FRAME_TIME
+    };
+    let rc = unsafe { rfofs_set_clock_mode(handle, other_mode) };
+    println!("rfofs_set_clock_mode({other_mode}) -> {rc}");
+    let rc = unsafe { rfofs_set_clock_mode(handle, clock_mode) };
+    println!("rfofs_set_clock_mode({clock_mode}) (restored) -> {rc}");
 
     // start_sample is an absolute sample count on the *server's* clock, not
     // relative to when this client connects — the server has typically been

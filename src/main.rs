@@ -12,9 +12,12 @@ use rfofs::{PanMode, RfofsEngine};
 /// (Offline WAV rendering via `OfflineRenderer` no longer has a CLI mode
 /// here — see `tests/offline_render.rs`, which exercises it directly.)
 ///
-/// Pass `--clock-mode <frame-time|transport|1|2>` to pick which JACK time
-/// source drives the engine's sample clock (see `rfofs::clock`); defaults
-/// to `frame-time`.
+/// Pass `--clock-mode <frame-time|transport|1|2>` to pick the *initial*
+/// JACK time source driving the engine's sample clock (see `rfofs::clock`);
+/// defaults to `frame-time`. A connected client can switch it live via
+/// `rfofs-client`'s `rfofs_set_clock_mode` — the process callback re-reads
+/// the shared control block's clock mode every block rather than caching
+/// this startup value.
 fn parse_clock_mode_arg() -> ClockMode {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -88,12 +91,19 @@ fn main() {
         move |client: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
             let block_size = ps.n_frames() as usize;
 
-            // Resync the engine's sample clock to the selected JACK time
-            // source before processing this block — see `rfofs::clock`.
-            // `JackTransport` falls back to the engine's own running clock
-            // if the query fails (e.g. client shutting down), rather than
-            // stalling the callback.
-            let block_start = match clock_mode {
+            // Resync the engine's sample clock to the currently selected
+            // JACK time source before processing this block — see
+            // `rfofs::clock`. Re-read from the shared control block every
+            // block (instead of the CLI-supplied startup value) so a
+            // connected client's `rfofs_set_clock_mode` call takes effect
+            // live. `JackTransport` falls back to the engine's own running
+            // clock if the query fails (e.g. client shutting down), rather
+            // than stalling the callback; an unrecognized stored value
+            // (shouldn't happen — `set_clock_mode` validates writes) falls
+            // back to the CLI-selected startup mode.
+            let active_clock_mode =
+                ClockMode::from_u32(shm_block.clock_mode()).unwrap_or(clock_mode);
+            let block_start = match active_clock_mode {
                 ClockMode::JackFrameTime => client.frame_time() as u64,
                 ClockMode::JackTransport => client
                     .transport()
