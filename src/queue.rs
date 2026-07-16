@@ -102,13 +102,32 @@ impl<T> Wheel<T> {
 
     /// Advance the wheel's clock to `now`, firing (draining, in order)
     /// every slot whose interval fully elapsed along the way.
+    ///
+    /// `now` is normally only ever a `block_size` or so past the wheel's
+    /// current clock, so this is normally O(1). But callers may also resync
+    /// the wheel's clock to an external, absolute time source (see
+    /// `RfofsEngine::set_sample_clock`, used for `ClockMode::JackFrameTime`)
+    /// whose origin predates the wheel's — e.g. `jack_frame_time()` counts
+    /// from when the *JACK server* started, not from when this wheel was
+    /// constructed, so the very first resync can jump `now` forward by
+    /// billions of samples. Once the gap spans a full rotation
+    /// (`n_slots` slots), every slot must still be drained once (any of
+    /// them could hold a stale-but-undrained event), but no slot needs
+    /// visiting more than once — anything further back than one rotation
+    /// could only have fired already — so we jump `slot_index` straight to
+    /// its target instead of stepping through the gap one slot at a time.
     fn advance(&mut self, now: u64, out: &mut Vec<T>) {
         let n_slots = self.n_slots() as u64;
-        while self.wheel_time() + self.slot_duration <= now {
-            let idx = (self.slot_index % n_slots) as usize;
-            out.extend(self.slots[idx].drain(..));
-            self.slot_index += 1;
+        let target_index = now / self.slot_duration;
+        if target_index <= self.slot_index {
+            return;
         }
+        let steps = (target_index - self.slot_index).min(n_slots);
+        for i in 0..steps {
+            let idx = ((self.slot_index + i) % n_slots) as usize;
+            out.extend(self.slots[idx].drain(..));
+        }
+        self.slot_index = target_index;
     }
 }
 
