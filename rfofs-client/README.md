@@ -8,6 +8,14 @@ no polling loop needed by the caller.
 Build: `cargo build --release -p rfofs-client` produces
 `target/release/librfofs_client.so`.
 
+Install: `make build && sudo make install` from the workspace root installs
+this library and its C header ([`rfofs_client.h`](rfofs_client.h)) alongside
+the `rfofs` binary (default prefix `/usr/local`, so the library lands at
+`/usr/local/lib/librfofs_client.so` and the header at
+`/usr/local/include/rfofs_client.h`) — see the root
+[README](../README.md#installation) for details and how to override the
+prefix.
+
 ## API
 
 ```c
