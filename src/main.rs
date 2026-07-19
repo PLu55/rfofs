@@ -1,3 +1,4 @@
+use clap::Parser;
 use rfofs::clock::ClockMode;
 use rfofs::queue::{kill_queue, time_wheel};
 use rfofs::shm::ServerShm;
@@ -11,34 +12,57 @@ use rfofs::{PanMode, RfofsEngine};
 ///
 /// (Offline WAV rendering via `OfflineRenderer` no longer has a CLI mode
 /// here — see `tests/offline_render.rs`, which exercises it directly.)
-///
-/// Pass `--clock-mode <frame-time|transport|1|2>` to pick the *initial*
-/// JACK time source driving the engine's sample clock (see `rfofs::clock`);
-/// defaults to `frame-time`. A connected client can switch it live via
-/// `rfofs-client`'s `rfofs_set_clock_mode` — the process callback re-reads
-/// the shared control block's clock mode every block rather than caching
-/// this startup value.
-fn parse_clock_mode_arg() -> ClockMode {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if let Some(value) = arg.strip_prefix("--clock-mode=") {
-            return ClockMode::parse(value).expect("invalid --clock-mode value");
-        }
-        if arg == "--clock-mode" {
-            let value = args.next().expect("--clock-mode requires a value");
-            return ClockMode::parse(&value).expect("invalid --clock-mode value");
-        }
+#[derive(Parser)]
+#[command(name = "rfofs", version, about = "Real-time FOF granular synthesizer (JACK server)")]
+struct Cli {
+    /// Initial JACK time source driving the engine's sample clock (see
+    /// `rfofs::clock`): frame-time|transport|1|2. A connected client can
+    /// switch it live afterwards via `rfofs-client`'s `rfofs_set_clock_mode`
+    /// — the process callback re-reads the shared control block's clock
+    /// mode every block rather than caching this startup value.
+    #[arg(long = "clock-mode", default_value = "frame-time", value_parser = parse_clock_mode)]
+    clock_mode: ClockMode,
+
+    /// Panning mode (see `rfofs::pan`), fixed for the process's lifetime —
+    /// output ports are registered from its channel count before the JACK
+    /// client activates. Either a numeric shortcut (1 = mono, 2 = stereo,
+    /// 3 = amb O1 D3, 4 = amb O1 D3 R0) or any raw `PanMode::parse`
+    /// notation string (e.g. "amb O2 D3 R1").
+    #[arg(short = 'm', long = "mode", default_value = "stereo", value_parser = parse_pan_mode)]
+    mode: PanMode,
+}
+
+fn parse_clock_mode(s: &str) -> Result<ClockMode, String> {
+    ClockMode::parse(s).ok_or_else(|| format!("invalid clock mode: {s}"))
+}
+
+/// Maps the numeric `-m`/`--mode` shortcuts to `PanMode::parse` notation
+/// strings. `1`/`2` are the plain mono/stereo modes; `3`/`4` are shortcuts
+/// for the ambisonic configurations used most often on the CLI (first-order
+/// 3D, with `4` adding a mono reverb bus) — anything else ambisonic still
+/// has to go through `PanMode::parse`'s full "amb OnDmRk" notation directly.
+fn mode_shortcut_to_pan_mode_str(value: &str) -> &str {
+    match value {
+        "1" => "mono",
+        "2" => "stereo",
+        "3" => "amb O1 D3",
+        "4" => "amb O1 D3 R0",
+        other => other,
     }
-    ClockMode::default()
+}
+
+fn parse_pan_mode(s: &str) -> Result<PanMode, String> {
+    PanMode::parse(mode_shortcut_to_pan_mode_str(s)).ok_or_else(|| format!("invalid mode: {s}"))
 }
 
 fn main() {
+    let cli = Cli::parse();
     env_logger::init();
 
     // ── Configuration ─────────────────────────────────────────────────────
-    let pan_mode = PanMode::parse("stereo").expect("invalid pan mode");
+    let pan_mode = cli.mode;
     let n_channels = pan_mode.channel_count();
-    let clock_mode = parse_clock_mode_arg();
+    let clock_mode = cli.clock_mode;
 
     // ── Queues ────────────────────────────────────────────────────────────
     // D = 256 samples (typical block size), N = 256 slots -> horizon ~= 65.5k
