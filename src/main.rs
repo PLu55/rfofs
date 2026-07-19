@@ -25,9 +25,10 @@ struct Cli {
 
     /// Panning mode (see `rfofs::pan`), fixed for the process's lifetime —
     /// output ports are registered from its channel count before the JACK
-    /// client activates. Either a numeric shortcut (1 = mono, 2 = stereo,
-    /// 3 = amb O1 D3, 4 = amb O1 D3 R0) or any raw `PanMode::parse`
-    /// notation string (e.g. "amb O2 D3 R1").
+    /// client activates. One of `mono`, `stereo`, or
+    /// `ambiO<n>D<2|3>[R<0|1>]` (e.g. `ambiO1D3`, `ambiO2D3R1`) — ambisonics
+    /// of order `n`, `2`- or 3-dimensional, with an optional reverb bus
+    /// (`R0` = mono, `R1` = first-order).
     #[arg(short = 'm', long = "mode", default_value = "stereo", value_parser = parse_pan_mode)]
     mode: PanMode,
 }
@@ -36,23 +37,47 @@ fn parse_clock_mode(s: &str) -> Result<ClockMode, String> {
     ClockMode::parse(s).ok_or_else(|| format!("invalid clock mode: {s}"))
 }
 
-/// Maps the numeric `-m`/`--mode` shortcuts to `PanMode::parse` notation
-/// strings. `1`/`2` are the plain mono/stereo modes; `3`/`4` are shortcuts
-/// for the ambisonic configurations used most often on the CLI (first-order
-/// 3D, with `4` adding a mono reverb bus) — anything else ambisonic still
-/// has to go through `PanMode::parse`'s full "amb OnDmRk" notation directly.
-fn mode_shortcut_to_pan_mode_str(value: &str) -> &str {
-    match value {
-        "1" => "mono",
-        "2" => "stereo",
-        "3" => "amb O1 D3",
-        "4" => "amb O1 D3 R0",
-        other => other,
-    }
-}
-
+/// Parses the CLI's `-m`/`--mode` value: `mono`, `stereo`, or
+/// `ambiO<n>D<2|3>[R<0|1>]` (e.g. `ambiO1D3`, `ambiO2D3R1`). This is a
+/// stricter, unspaced sibling of `PanMode::parse`'s "amb O2 D3 R1" notation,
+/// purpose-built for shell arguments.
 fn parse_pan_mode(s: &str) -> Result<PanMode, String> {
-    PanMode::parse(mode_shortcut_to_pan_mode_str(s)).ok_or_else(|| format!("invalid mode: {s}"))
+    if s.eq_ignore_ascii_case("mono") {
+        return Ok(PanMode::Mono);
+    }
+    if s.eq_ignore_ascii_case("stereo") {
+        return Ok(PanMode::Stereo);
+    }
+
+    let invalid = || format!("invalid mode: {s}");
+
+    let rest = s.strip_prefix("ambi").ok_or_else(invalid)?;
+    let rest = rest.strip_prefix('O').ok_or_else(invalid)?;
+    let d_pos = rest.find('D').ok_or_else(invalid)?;
+    let order: u8 = rest[..d_pos].parse().map_err(|_| invalid())?;
+
+    let after_d = &rest[d_pos + 1..];
+    let (dims_str, reverb_str) = match after_d.find('R') {
+        Some(r_pos) => (&after_d[..r_pos], Some(&after_d[r_pos + 1..])),
+        None => (after_d, None),
+    };
+    let dims: u8 = dims_str.parse().map_err(|_| invalid())?;
+    if dims != 2 && dims != 3 {
+        return Err(invalid());
+    }
+
+    let reverb = match reverb_str {
+        None => None,
+        Some(r) => {
+            let k: u8 = r.parse().map_err(|_| invalid())?;
+            if k != 0 && k != 1 {
+                return Err(invalid());
+            }
+            Some(k)
+        }
+    };
+
+    Ok(PanMode::Ambisonic { order, dims, reverb })
 }
 
 fn main() {
