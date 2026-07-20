@@ -21,95 +21,44 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use clap::Parser;
 use rtrb::RingBuffer;
 use sndfile::{Endian, MajorFormat, OpenOptions, SndFile, SndFileIO, SubtypeFormat, WriteOptions};
 
+#[derive(Parser)]
+#[command(
+    name = "jack_probe",
+    version,
+    about = "Connect to existing JACK output ports, measure RMS/dBFS, and optionally record to WAV"
+)]
 struct Args {
+    /// POSIX regex matched against existing JACK output port names, e.g. "rfofs:out_.*"
+    #[arg(short = 'p', long)]
     pattern: String,
+
+    /// Index of the first match to probe
+    #[arg(short = 's', long, default_value_t = 0)]
     start: usize,
+
+    /// Number of matched ports to probe, starting at --start
+    #[arg(short = 'n', long, value_parser = parse_nonzero_count)]
     count: usize,
+
+    /// Write the probed signal to a multichannel WAV file
+    #[arg(short = 'o', long)]
     output: Option<PathBuf>,
+
+    /// Seconds to run before stopping (default: run until Enter is pressed)
+    #[arg(short = 'd', long)]
     duration: Option<f64>,
 }
 
-fn print_usage() {
-    eprintln!(
-        "usage: jack_probe --pattern <regex> --count <N> [--start <N>] [--output <path.wav>] [--duration <secs>]\n\n\
-         --pattern   POSIX regex matched against existing JACK output port names\n\
-         --start     index of the first match to probe (default 0)\n\
-         --count     number of matched ports to probe, starting at --start\n\
-         --output    write the probed signal to a multichannel WAV file\n\
-         --duration  seconds to run before stopping (default: run until Enter is pressed)"
-    );
-}
-
-fn parse_args() -> Args {
-    let mut pattern = None;
-    let mut start = 0usize;
-    let mut count = None;
-    let mut output = None;
-    let mut duration = None;
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--pattern" | "-p" => {
-                pattern = Some(args.next().expect("--pattern requires a value"));
-            }
-            "--start" | "-s" => {
-                start = args
-                    .next()
-                    .expect("--start requires a value")
-                    .parse()
-                    .expect("--start must be an integer");
-            }
-            "--count" | "-n" => {
-                count = Some(
-                    args.next()
-                        .expect("--count requires a value")
-                        .parse()
-                        .expect("--count must be an integer"),
-                );
-            }
-            "--output" | "-o" => {
-                output = Some(PathBuf::from(args.next().expect("--output requires a value")));
-            }
-            "--duration" | "-d" => {
-                duration = Some(
-                    args.next()
-                        .expect("--duration requires a value")
-                        .parse()
-                        .expect("--duration must be a number"),
-                );
-            }
-            "--help" | "-h" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            other => {
-                eprintln!("unrecognized argument: {other}");
-                print_usage();
-                std::process::exit(1);
-            }
-        }
+fn parse_nonzero_count(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|_| format!("invalid count: {s}"))?;
+    if n == 0 {
+        return Err("--count must be > 0".to_string());
     }
-
-    let pattern = pattern.unwrap_or_else(|| {
-        eprintln!("--pattern is required");
-        print_usage();
-        std::process::exit(1);
-    });
-    let count = count.unwrap_or_else(|| {
-        eprintln!("--count is required");
-        print_usage();
-        std::process::exit(1);
-    });
-    if count == 0 {
-        eprintln!("--count must be > 0");
-        std::process::exit(1);
-    }
-
-    Args { pattern, start, count, output, duration }
+    Ok(n)
 }
 
 /// Accumulated over the run by the writer thread, off the JACK real-time
@@ -121,7 +70,7 @@ struct WriterResult {
 
 fn main() {
     env_logger::init();
-    let args = parse_args();
+    let args = Args::parse();
 
     let (client, _status) = jack::Client::new("rfofs_probe", jack::ClientOptions::NO_START_SERVER)
         .expect("failed to open JACK client");
