@@ -7,14 +7,14 @@
 //! client's outputs) and is otherwise independent of the `rfofs` engine.
 //!
 //! Usage:
-//!   jack_probe --pattern <regex> --count <N> [--start <N>] [--output <path.wav>] [--duration <secs>]
+//!   jack_probe [--pattern <regex>] [--count <N>] [--start <N>] [--output <path.wav>] [--duration <secs>]
 //!
-//! `--pattern` is matched against existing JACK output port names using
-//! JACK's own POSIX regex port matching (see `jack::Client::ports`).
-//! `--start`/`--count` select a slice of the matches (in JACK's own
-//! registration-order listing) to actually probe — e.g.
-//! `--pattern 'rfofs:out_.*' --start 0 --count 2` probes the first two
-//! `rfofs:out_*` ports.
+//! `--pattern` (default `rfofs:out_.*`) is matched against existing JACK
+//! output port names using JACK's own POSIX regex port matching (see
+//! `jack::Client::ports`). `--start`/`--count` (default 1) select a slice of
+//! the matches (in JACK's own registration-order listing) to actually
+//! probe — e.g. `--pattern 'rfofs:out_.*' --start 0 --count 2` probes the
+//! first two `rfofs:out_*` ports.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,8 +32,8 @@ use sndfile::{Endian, MajorFormat, OpenOptions, SndFile, SndFileIO, SubtypeForma
     about = "Connect to existing JACK output ports, measure RMS/dBFS, and optionally record to WAV"
 )]
 struct Args {
-    /// POSIX regex matched against existing JACK output port names, e.g. "rfofs:out_.*"
-    #[arg(short = 'p', long)]
+    /// POSIX regex matched against existing JACK output port names"
+    #[arg(short = 'p', long, default_value = "rfofs:out_.*")]
     pattern: String,
 
     /// Index of the first match to probe
@@ -41,7 +41,7 @@ struct Args {
     start: usize,
 
     /// Number of matched ports to probe, starting at --start
-    #[arg(short = 'n', long, value_parser = parse_nonzero_count)]
+    #[arg(short = 'n', long, default_value_t = 1, value_parser = parse_nonzero_count)]
     count: usize,
 
     /// Write the probed signal to a multichannel WAV file
