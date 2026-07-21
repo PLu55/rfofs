@@ -310,6 +310,191 @@ fn fof_onset_is_audible_after_live_clock_mode_switch() {
     assert_silence_then_onset(&samples);
 }
 
+/// Online-server counterpart to `continuous_fofs_produce_signal_throughout`
+/// in `tests/offline_render.rs`'s sibling `tests/continuous_fofs.rs`: drips
+/// ~0.2 s FOFs into a live `rfofs` server at 10-20/sec for about a minute of
+/// real (wall-clock) recording via `jack_probe`, and checks the recorded
+/// signal never goes silent in between.
+///
+/// Unlike `run_fof_smoke_test`'s single mid-recording onset, onsets here are
+/// submitted progressively — each scheduled a fixed `lead_secs` ahead of the
+/// server's own live `current_sample()` — rather than all at once, since the
+/// time wheel's horizon (`n_slots * block_size` samples, see `src/queue.rs`)
+/// is far shorter than the full minute.
+#[test]
+fn continuous_fofs_produce_signal_throughout_on_jack_output() {
+    let _serial = serial_guard();
+
+    let shm_name = format!("/rfofs_ctl_test_continuous_{}", std::process::id());
+    let _shm_cleanup = ShmCleanup(CString::new(shm_name.clone()).unwrap());
+    // SAFETY: serialized by `serial_guard()` above — no concurrent access to
+    // the process environment from other tests in this binary.
+    unsafe { std::env::set_var(SHM_NAME_ENV, &shm_name) };
+
+    let (harness_client, _status) = jack::Client::new(
+        "rfofs_test_harness_continuous",
+        jack::ClientOptions::NO_START_SERVER,
+    )
+    .expect("failed to open JACK client — is a JACK server running?");
+    let existing_ports =
+        harness_client.ports(Some("^rfofs.*:out_.*$"), None, jack::PortFlags::IS_OUTPUT);
+
+    let _server = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_rfofs"))
+            .env(SHM_NAME_ENV, &shm_name)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn rfofs server"),
+    );
+
+    let mut new_ports = wait_for_new_ports(
+        &harness_client,
+        "^rfofs.*:out_.*$",
+        &existing_ports,
+        Duration::from_secs(10),
+    );
+    new_ports.sort();
+    let client_name = new_ports[0].split(':').next().unwrap().to_string();
+
+    let client_shm = ClientShm::attach().expect("failed to attach to rfofs control plane");
+    let sample_rate = client_shm.block().sample_rate();
+
+    let push_duration_secs = 60.0f64;
+    let fofs_per_second = 15.0f64; // within the requested 10-20/s range
+    let interval = Duration::from_secs_f64(1.0 / fofs_per_second);
+    // Schedule each onset this far ahead of "now" — needs enough slack to
+    // absorb real scheduling jitter (bridging-thread poll latency, JACK
+    // callback scheduling, slower debug builds) that a single generously
+    // pre-scheduled onset (see `run_fof_smoke_test`'s 0.5 s) doesn't have to
+    // worry about, since here every onset is timed close to its deadline.
+    let lead_secs = 0.2f64;
+
+    // ~0.2 s grains: short attack, exponential decay tuned so the envelope
+    // has fallen to fade_level (-60 dB) by ~0.2 s in — same shaping as
+    // `tests/continuous_fofs.rs`'s offline counterpart.
+    let beta = 0.005f32;
+    let fade_level = 0.001f32;
+    let fade_dur = 0.01f32;
+    let fof_duration_s = 0.2f32;
+    let alpha = -fade_level.ln() / (fof_duration_s - beta);
+
+    let wav_path = format!(
+        "{}/jack_probe_continuous_{}.wav",
+        env!("CARGO_TARGET_TMPDIR"),
+        std::process::id()
+    );
+    // A bit longer than the push loop so the last grain's tail gets captured.
+    let probe_duration_secs = push_duration_secs + 2.0;
+
+    let probe = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_jack_probe"))
+            .args([
+                "--pattern",
+                &format!("{client_name}:out_.*"),
+                "--count",
+                "2",
+                "--duration",
+                &probe_duration_secs.to_string(),
+                "--output",
+                &wav_path,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("failed to spawn jack_probe"),
+    );
+
+    // Let jack_probe finish registering + connecting its input ports before
+    // the drip starts, so recording has already started by the time the
+    // first onset fires.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let freqs = [261.63f32, 293.66, 329.63, 392.00, 440.00]; // C4 D4 E4 G4 A4
+    let azms = [-1.0f32, 0.0, 1.0];
+    let n_fofs = (push_duration_secs * fofs_per_second) as u64;
+
+    for i in 0..n_fofs {
+        let start_sample =
+            client_shm.block().current_sample() + (sample_rate as f64 * lead_secs) as u64;
+        client_shm
+            .block()
+            .try_push_fof(FofParams {
+                id: 0,
+                start_sample,
+                f: freqs[(i as usize) % freqs.len()],
+                gliss: 0.0,
+                phi: 0.0,
+                amp: 0.5,
+                alpha,
+                beta,
+                fade_level,
+                fade_dur,
+                azm: azms[(i as usize) % azms.len()],
+                elev: 0.0,
+                distance: 1.0,
+            })
+            .expect("fof request ring full");
+        std::thread::sleep(interval);
+    }
+
+    let mut probe = probe;
+    let status = probe.0.wait().expect("failed to wait on jack_probe");
+    assert!(status.success(), "jack_probe exited with {status}");
+
+    let mut snd = OpenOptions::ReadOnly(ReadOptions::Auto)
+        .from_path(&wav_path)
+        .expect("failed to open jack_probe's recorded wav");
+    let n_channels = snd.get_channels();
+    assert_eq!(n_channels, 2);
+    let samples: Vec<f32> =
+        SndFileIO::<f32>::read_all_to_vec(&mut snd).expect("failed to read recorded samples");
+    let _ = std::fs::remove_file(&wav_path);
+
+    let n_frames = samples.len() / n_channels;
+    assert!(n_frames > 0, "recorded wav should contain samples");
+
+    // Trim the very start (before the first grain's attack) and stop
+    // checking well before the drip itself stopped (`push_duration_secs`
+    // after roughly `start_frame`) rather than near the end of the
+    // recording: `probe_duration_secs` deliberately runs ~2 s longer than
+    // the push loop so the *last* grain's tail gets captured on tape, and
+    // that trailing stretch is expected to fall silent once the drip ends —
+    // it's not part of what this test is checking. Real-time scheduling
+    // jitter earns a more generous margin here than the offline
+    // counterpart's, since onset timing is only wall-clock-approximate.
+    let margin_frames = (sample_rate as usize) / 2; // 0.5 s
+    let start_frame = margin_frames.min(n_frames);
+    let push_frames = (push_duration_secs * sample_rate as f64) as usize;
+    let end_frame = (start_frame + push_frames)
+        .saturating_sub(margin_frames)
+        .min(n_frames)
+        .max(start_frame);
+
+    // Any 100 ms window in the steady-state region must contain signal —
+    // shorter than the ~67 ms gap between consecutive grain onsets, so a
+    // real dropout can't hide between windows.
+    let window_frames = (sample_rate as usize) / 10;
+    let threshold = 1e-3; // a live recording's noise floor is higher than the offline WAV's
+
+    let mut frame = start_frame;
+    while frame < end_frame {
+        let window_end = (frame + window_frames).min(end_frame);
+        let has_signal = (frame..window_end).any(|fr| {
+            (0..n_channels).any(|ch| samples[fr * n_channels + ch].abs() > threshold)
+        });
+        assert!(
+            has_signal,
+            "silence detected in [{:.3}s, {:.3}s)",
+            frame as f32 / sample_rate,
+            window_end as f32 / sample_rate,
+        );
+        frame = window_end;
+    }
+}
+
 #[test]
 fn set_clock_mode_rejects_unknown_values() {
     let _serial = serial_guard();

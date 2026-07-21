@@ -4,6 +4,13 @@ use rfofs::queue::{kill_queue, time_wheel};
 use rfofs::shm::ServerShm;
 use rfofs::{PanMode, RfofsEngine};
 
+/// Upper bound on the JACK-reported block size this process will accept.
+/// `RfofsEngine`'s scratch buffers are preallocated to this size (see
+/// `rfofs::engine`); JACK reporting a larger block at startup would force a
+/// resize on the audio thread the first time it's hit, violating the
+/// allocation-free `process_block` invariant, so we refuse to start instead.
+const MAX_BLOCK_SIZE: usize = 1024;
+
 /// `rfofs`'s online server: a JACK client whose FOF onsets and kills are
 /// driven entirely by external processes (e.g. Racket via the
 /// `rfofs-client` cdylib) over the shared-memory control plane in
@@ -20,7 +27,7 @@ struct Cli {
     /// switch it live afterwards via `rfofs-client`'s `rfofs_set_clock_mode`
     /// — the process callback re-reads the shared control block's clock
     /// mode every block rather than caching this startup value.
-    #[arg(long = "clock-mode", default_value = "frame-time", value_parser = parse_clock_mode)]
+    #[arg(short = 'c', long = "clock-mode", default_value = "frame-time", value_parser = parse_clock_mode)]
     clock_mode: ClockMode,
 
     /// Panning mode (see `rfofs::pan`), fixed for the process's lifetime —
@@ -31,6 +38,23 @@ struct Cli {
     /// (`R0` = mono, `R1` = first-order).
     #[arg(short = 'm', long = "mode", default_value = "stereo", value_parser = parse_pan_mode)]
     mode: PanMode,
+
+    /// Capacity of the SPSC ring buffer carrying incoming FOF onsets from
+    /// the control-plane bridging thread into the time wheel (see
+    /// `rfofs::queue::time_wheel`'s `ingress_capacity`).
+    #[arg(short = 'i', long = "ingress-capacity", default_value_t = 4096)]
+    ingress_capacity: usize,
+
+    /// Number of slots (`N`) in the onset time wheel. Combined with the
+    /// slot duration (the JACK server's block size), this sets the wheel's
+    /// scheduling horizon (`n_slots * block_size` samples).
+    #[arg(short = 'n', long = "n-slots", default_value_t = 256)]
+    n_slots: usize,
+
+    /// Maximum simultaneous onsets per wheel slot (`M`) — see
+    /// `rfofs::queue::Wheel`.
+    #[arg(short = 'k', long = "slot-capacity", default_value_t = 64)]
+    slot_capacity: usize,
 }
 
 fn parse_clock_mode(s: &str) -> Result<ClockMode, String> {
@@ -89,19 +113,30 @@ fn main() {
     let n_channels = pan_mode.channel_count();
     let clock_mode = cli.clock_mode;
 
-    // ── Queues ────────────────────────────────────────────────────────────
-    // D = 256 samples (typical block size), N = 256 slots -> horizon ~= 65.5k
-    // samples (~1.4 s @48kHz), M = 64 simultaneous onsets per slot.
-    let (mut wheel_tx, mut wheel_rx) = time_wheel(4096, 256, 256, 64);
-    let (mut kill_tx, kill_rx) = kill_queue(256);
-
     // ── JACK client ───────────────────────────────────────────────────────
     let (client, _status) =
         jack::Client::new("rfofs", jack::ClientOptions::NO_START_SERVER)
             .expect("failed to open JACK client");
 
     let sample_rate = client.sample_rate() as f32;
-    let max_block_size = client.buffer_size() as usize;
+    let block_size = client.buffer_size() as usize;
+    if block_size > MAX_BLOCK_SIZE {
+        eprintln!(
+            "JACK block size {block_size} exceeds the maximum this server supports ({MAX_BLOCK_SIZE}); \
+             reconfigure JACK with a smaller buffer size and restart."
+        );
+        std::process::exit(1);
+    }
+
+    // ── Queues ────────────────────────────────────────────────────────────
+    // D = JACK's current block size (the wheel fires in lockstep with the
+    // process callback, so this is the natural slot granularity); N
+    // (n_slots) and M (slot_capacity) are CLI-configurable, defaulting to a
+    // horizon of n_slots * block_size samples with up to 64 simultaneous
+    // onsets per slot.
+    let (mut wheel_tx, mut wheel_rx) =
+        time_wheel(cli.ingress_capacity, cli.n_slots, block_size as u64, cli.slot_capacity);
+    let (mut kill_tx, kill_rx) = kill_queue(256);
 
     // ── Control-plane shared memory ──────────────────────────────────────
     // Lets an external process (e.g. Racket via the rfofs-client cdylib)
@@ -111,7 +146,7 @@ fn main() {
     // with no separate sync step. Published alongside the actual sample
     // rate/buffer size JACK just handed us, so clients don't have to assume
     // fixed values.
-    let shm = ServerShm::create(sample_rate, max_block_size as u32, clock_mode.as_u32())
+    let shm = ServerShm::create(sample_rate, block_size as u32, clock_mode.as_u32())
         .expect("failed to create control-plane shm segment");
     let shm_block = shm.block();
     wheel_rx.attach_stats(&shm_block.stats);
@@ -130,7 +165,7 @@ fn main() {
         sample_rate,
         pan_mode,
         4096,            // initial FOF pool capacity
-        max_block_size,
+        MAX_BLOCK_SIZE,
         vec![wheel_rx],
         kill_rx,
     );
