@@ -82,10 +82,12 @@ impl<T> Wheel<T> {
 
     /// Schedule `event` to fire when the wheel's clock reaches `deadline`.
     ///
-    /// Rejects (returning the event back) if `deadline` is already behind
-    /// the wheel's clock, at or beyond the horizon, or its target slot is
-    /// already at capacity `M`.
-    fn schedule(&mut self, event: T, deadline: u64) -> Result<(), (T, RejectReason)> {
+    /// On success, returns `slot_delta` — how many slots ahead of the
+    /// wheel's current slot the event landed in (0 means the currently
+    /// active slot). Rejects (returning the event back) if `deadline` is
+    /// already behind the wheel's clock, at or beyond the horizon, or its
+    /// target slot is already at capacity `M`.
+    fn schedule(&mut self, event: T, deadline: u64) -> Result<u64, (T, RejectReason)> {
         let now = self.wheel_time();
         if deadline < now {
             return Err((event, RejectReason::TooLate)); // overdue — ignored
@@ -102,7 +104,7 @@ impl<T> Wheel<T> {
             return Err((event, RejectReason::SlotFull)); // slot full — ignored
         }
         slot.push(event);
-        Ok(())
+        Ok(slot_delta)
     }
 
     /// Advance the wheel's clock to `now`, firing (draining, in order)
@@ -136,13 +138,21 @@ impl<T> Wheel<T> {
     }
 }
 
+/// Width of [`QueueStats::slot_offset_histogram`], fixed at compile time so
+/// the histogram can be embedded directly in the shared-memory control
+/// block regardless of the wheel's actual `n_slots` (CLI-configurable, see
+/// `main.rs`, and potentially far larger than this). Bucket `i` counts
+/// events admitted exactly `i` slots ahead of the wheel's current slot, for
+/// `i < SLOT_OFFSET_HISTOGRAM_BUCKETS - 1`; the last bucket is an overflow
+/// counting everything `>= SLOT_OFFSET_HISTOGRAM_BUCKETS - 1` slots ahead.
+pub const SLOT_OFFSET_HISTOGRAM_BUCKETS: usize = 64;
+
 /// Lock-free counters tracking [`TimeWheelConsumer`] admission/scheduling
 /// outcomes, plus current wheel occupancy. `#[repr(C)]` so it can be
 /// embedded directly inside a shared-memory segment (see `shm.rs`) and read
 /// by an external process without any locking or copying — the audio
 /// thread updates these in place from [`TimeWheelConsumer::drain_block_safe`].
 #[repr(C)]
-#[derive(Default)]
 pub struct QueueStats {
     /// Count of events rejected because their deadline had already passed
     /// (see [`RejectReason::TooLate`]).
@@ -159,6 +169,24 @@ pub struct QueueStats {
     pub slot_full: AtomicU64,
     /// Number of events currently scheduled in the wheel, not yet fired.
     pub queue_size: AtomicU64,
+    /// Histogram of how many slots ahead of the wheel's current slot each
+    /// successfully admitted event landed in — see
+    /// [`SLOT_OFFSET_HISTOGRAM_BUCKETS`]. Lets an external reader see
+    /// whether onsets tend to arrive just-in-time (mass near bucket 0) or
+    /// scheduled well ahead (mass in higher buckets, or the overflow one).
+    pub slot_offset_histogram: [AtomicU64; SLOT_OFFSET_HISTOGRAM_BUCKETS],
+}
+
+impl Default for QueueStats {
+    fn default() -> Self {
+        QueueStats {
+            too_late: AtomicU64::new(0),
+            too_early: AtomicU64::new(0),
+            slot_full: AtomicU64::new(0),
+            queue_size: AtomicU64::new(0),
+            slot_offset_histogram: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
 }
 
 /// Producer handle for a [`Wheel`]-backed FOF schedule.
@@ -267,15 +295,22 @@ impl TimeWheelConsumer {
                 #[cfg_attr(not(feature = "statistics"), allow(unused_variables))]
                 let result = self.wheel.schedule(params, params.start_sample);
                 #[cfg(feature = "statistics")]
-                if let Err((_, reason)) = result
-                    && let Some(stats) = self.stats
-                {
-                    let counter = match reason {
-                        RejectReason::TooLate => &stats.too_late,
-                        RejectReason::TooEarly => &stats.too_early,
-                        RejectReason::SlotFull => &stats.slot_full,
-                    };
-                    counter.fetch_add(1, Ordering::Relaxed);
+                if let Some(stats) = self.stats {
+                    match result {
+                        Ok(slot_delta) => {
+                            let bucket =
+                                (slot_delta as usize).min(SLOT_OFFSET_HISTOGRAM_BUCKETS - 1);
+                            stats.slot_offset_histogram[bucket].fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err((_, reason)) => {
+                            let counter = match reason {
+                                RejectReason::TooLate => &stats.too_late,
+                                RejectReason::TooEarly => &stats.too_early,
+                                RejectReason::SlotFull => &stats.slot_full,
+                            };
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
             } else {
                 // Not yet within the admission window — leave in buffer.
@@ -573,6 +608,37 @@ mod tests {
         rx.drain_block_safe(0, 10, &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(stats.slot_full.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "statistics")]
+    fn drain_block_safe_tracks_slot_offset_histogram_when_stats_attached() {
+        let (mut tx, mut rx) = time_wheel(8, 8, 16, 8); // n_slots=8, D=16 -> horizon=128
+        let stats: &'static QueueStats = Box::leak(Box::default());
+        rx.attach_stats(stats);
+        tx.push(params(0)).unwrap(); // lands in the current slot: slot_delta 0
+        tx.push(params(32)).unwrap(); // 2 slots ahead: slot_delta 2
+
+        let mut out = Vec::new();
+        rx.drain_block_safe(0, 16, &mut out); // scheduling happens before the wheel advances
+        assert_eq!(stats.slot_offset_histogram[0].load(Ordering::Relaxed), 1);
+        assert_eq!(stats.slot_offset_histogram[2].load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "statistics")]
+    fn drain_block_safe_clamps_far_slot_offsets_into_the_overflow_bucket() {
+        let (mut tx, mut rx) = time_wheel(8, 200, 1, 8); // n_slots=200, D=1 -> horizon=200
+        let stats: &'static QueueStats = Box::leak(Box::default());
+        rx.attach_stats(stats);
+        tx.push(params(150)).unwrap(); // slot_delta 150, far past the histogram's width
+
+        let mut out = Vec::new();
+        rx.drain_block_safe(0, 1, &mut out);
+        assert_eq!(
+            stats.slot_offset_histogram[SLOT_OFFSET_HISTOGRAM_BUCKETS - 1].load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

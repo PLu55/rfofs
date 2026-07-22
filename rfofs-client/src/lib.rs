@@ -20,6 +20,12 @@ pub const RFOFS_CLOCK_JACK_FRAME_TIME: u32 = rfofs::clock::RFOFS_CLOCK_JACK_FRAM
 /// `rfofs::clock::RFOFS_CLOCK_JACK_TRANSPORT`.
 pub const RFOFS_CLOCK_JACK_TRANSPORT: u32 = rfofs::clock::RFOFS_CLOCK_JACK_TRANSPORT;
 
+/// Width of `RfofsStats::slot_offset_histogram`. Mirrors
+/// `rfofs::queue::SLOT_OFFSET_HISTOGRAM_BUCKETS` — kept as a separate
+/// constant here since C-ABI consumers of this cdylib don't link against
+/// the `rfofs` crate directly.
+pub const RFOFS_SLOT_OFFSET_HISTOGRAM_BUCKETS: usize = rfofs::queue::SLOT_OFFSET_HISTOGRAM_BUCKETS;
+
 /// Opaque handle returned by [`rfofs_connect`].
 pub struct ClientHandle(ClientShm);
 
@@ -30,6 +36,13 @@ pub struct RfofsStats {
     pub too_early: u64,
     pub slot_full: u64,
     pub queue_size: u64,
+    /// Histogram of how many slots ahead of the wheel's current slot each
+    /// admitted FOF landed in at scheduling time — bucket `i` counts
+    /// `slot_delta == i` events, except the last bucket
+    /// (`RFOFS_SLOT_OFFSET_HISTOGRAM_BUCKETS - 1`), which is an overflow for
+    /// everything at or beyond that many slots ahead. See
+    /// `rfofs::queue::SLOT_OFFSET_HISTOGRAM_BUCKETS`.
+    pub slot_offset_histogram: [u64; RFOFS_SLOT_OFFSET_HISTOGRAM_BUCKETS],
 }
 
 /// Attempt to attach to an already-running `rfofs`'s control plane.
@@ -237,11 +250,16 @@ pub unsafe extern "C" fn rfofs_get_stats(handle: *mut ClientHandle, out: *mut Rf
         return -1;
     }
     let stats = &handle.0.block().stats;
+    let mut slot_offset_histogram = [0u64; RFOFS_SLOT_OFFSET_HISTOGRAM_BUCKETS];
+    for (dst, src) in slot_offset_histogram.iter_mut().zip(stats.slot_offset_histogram.iter()) {
+        *dst = src.load(std::sync::atomic::Ordering::Relaxed);
+    }
     let snapshot = RfofsStats {
         too_late: stats.too_late.load(std::sync::atomic::Ordering::Relaxed),
         too_early: stats.too_early.load(std::sync::atomic::Ordering::Relaxed),
         slot_full: stats.slot_full.load(std::sync::atomic::Ordering::Relaxed),
         queue_size: stats.queue_size.load(std::sync::atomic::Ordering::Relaxed),
+        slot_offset_histogram,
     };
     unsafe { out.write(snapshot) };
     0

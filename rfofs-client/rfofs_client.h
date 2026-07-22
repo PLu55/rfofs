@@ -23,15 +23,24 @@ extern "C" {
 #define RFOFS_CLOCK_JACK_FRAME_TIME 1u
 #define RFOFS_CLOCK_JACK_TRANSPORT  2u
 
+/* Width of RfofsStats.slot_offset_histogram — mirrors
+ * rfofs::queue::SLOT_OFFSET_HISTOGRAM_BUCKETS (src/queue.rs). */
+#define RFOFS_SLOT_OFFSET_HISTOGRAM_BUCKETS 64u
+
 /* Opaque handle returned by rfofs_connect(); pass to every other call. */
 typedef struct ClientHandle ClientHandle;
 
-/* Snapshot of the queue stats living in the shared control block. */
+/* Snapshot of the queue stats living in the shared control block.
+ * slot_offset_histogram[i] counts FOFs admitted exactly i slots ahead of the
+ * wheel's current slot, except the last bucket
+ * (RFOFS_SLOT_OFFSET_HISTOGRAM_BUCKETS - 1), which is an overflow for
+ * everything at or beyond that many slots ahead. */
 typedef struct RfofsStats {
     uint64_t too_late;
     uint64_t too_early;
     uint64_t slot_full;
     uint64_t queue_size;
+    uint64_t slot_offset_histogram[RFOFS_SLOT_OFFSET_HISTOGRAM_BUCKETS];
 } RfofsStats;
 
 /* Attempt to attach to an already-running rfofs's control plane.

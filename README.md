@@ -51,12 +51,13 @@ the `cargo` command above instead when you want stats, then `sudo make
 install` as usual to install the resulting binary/library.)
 
 With this feature, the running `rfofs` server keeps its scheduling stats
-(rejected/admitted FOF counts, live queue size — see `QueueStats` in
-`src/queue.rs`) up to date in the shared control block, readable live via
-`rfofs-client`'s `rfofs_get_stats`. A connected client can check
-`rfofs_stats_enabled` to tell whether the server it's attached to was built
-with this feature — without it, `rfofs_get_stats` still succeeds but every
-field reads back as 0.
+(rejected/admitted FOF counts, live queue size, and a histogram of how many
+slots ahead of the wheel's current slot each admitted FOF landed in — see
+`QueueStats` in `src/queue.rs`) up to date in the shared control block,
+readable live via `rfofs-client`'s `rfofs_get_stats`. A connected client can
+check `rfofs_stats_enabled` to tell whether the server it's attached to was
+built with this feature — without it, `rfofs_get_stats` still succeeds but
+every field reads back as 0.
 
 ### Portability note
 

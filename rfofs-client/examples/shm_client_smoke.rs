@@ -14,7 +14,8 @@
 use rfofs_client::{
     rfofs_add_fof, rfofs_block_size, rfofs_clock_mode, rfofs_connect, rfofs_current_sample,
     rfofs_disconnect, rfofs_get_stats, rfofs_kill, rfofs_sample_rate, rfofs_set_clock_mode,
-    RfofsStats, RFOFS_CLOCK_JACK_FRAME_TIME, RFOFS_CLOCK_JACK_TRANSPORT,
+    rfofs_stats_enabled, RfofsStats, RFOFS_CLOCK_JACK_FRAME_TIME, RFOFS_CLOCK_JACK_TRANSPORT,
+    RFOFS_SLOT_OFFSET_HISTOGRAM_BUCKETS,
 };
 
 fn main() {
@@ -81,12 +82,28 @@ fn main() {
 
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    let mut stats = RfofsStats { too_late: 0, too_early: 0, slot_full: 0, queue_size: 0 };
+    let stats_enabled = unsafe { rfofs_stats_enabled(handle) };
+    println!("rfofs_stats_enabled -> {stats_enabled}");
+
+    let mut stats = RfofsStats {
+        too_late: 0,
+        too_early: 0,
+        slot_full: 0,
+        queue_size: 0,
+        slot_offset_histogram: [0; RFOFS_SLOT_OFFSET_HISTOGRAM_BUCKETS],
+    };
     let rc = unsafe { rfofs_get_stats(handle, &mut stats) };
     println!(
         "rfofs_get_stats -> {rc}: too_late={} too_early={} slot_full={} queue_size={}",
         stats.too_late, stats.too_early, stats.slot_full, stats.queue_size
     );
+    // Only print non-zero buckets — with a default 256-slot wheel most of
+    // the histogram's 64 buckets will be empty for a smoke test this short.
+    for (i, count) in stats.slot_offset_histogram.iter().enumerate() {
+        if *count > 0 {
+            println!("  slot_offset_histogram[{i}] = {count}");
+        }
+    }
 
     unsafe { rfofs_disconnect(handle) };
     println!("disconnected");
