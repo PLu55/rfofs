@@ -207,6 +207,21 @@ pub unsafe extern "C" fn rfofs_kill(handle: *mut ClientHandle, id: u64, fade_dur
     }
 }
 
+/// Whether the connected server was built with the `statistics` feature —
+/// i.e. whether the counts read back by [`rfofs_get_stats`] are actually
+/// being tracked. When this returns `false`, `rfofs_get_stats` still
+/// succeeds but every field reads back as 0 regardless of real scheduling
+/// activity. Returns `false` if `handle` is null.
+///
+/// # Safety
+/// `handle` must be null or a valid pointer returned by [`rfofs_connect`]
+/// that hasn't yet been passed to [`rfofs_disconnect`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rfofs_stats_enabled(handle: *mut ClientHandle) -> bool {
+    let Some(handle) = (unsafe { handle.as_ref() }) else { return false };
+    handle.0.block().stats_enabled()
+}
+
 /// Read a live snapshot of the queue stats into `*out`.
 ///
 /// Returns 0 on success, -1 if `handle` or `out` is null.

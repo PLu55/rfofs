@@ -1,4 +1,6 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+#[cfg(feature = "statistics")]
+use std::sync::atomic::Ordering;
 
 use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use crate::fof::{FofParams, FofKillRequest};
@@ -60,7 +62,10 @@ impl<T> Wheel<T> {
 
     /// Total number of events currently sitting in the wheel's slots,
     /// scheduled but not yet fired. O(`n_slots`); only called once per
-    /// audio block (from `drain_block_safe`), so this is negligible.
+    /// audio block (from `drain_block_safe`), so this is negligible. Only
+    /// used when the `statistics` feature is enabled (plus its own unit
+    /// test), hence the `dead_code` allowance for builds without it.
+    #[cfg_attr(not(feature = "statistics"), allow(dead_code))]
     fn len(&self) -> usize {
         self.slots.iter().map(Vec::len).sum()
     }
@@ -180,9 +185,11 @@ pub struct TimeWheelConsumer {
     wheel: Wheel<FofParams>,
     /// Optional stats sink, attached post-construction via [`attach_stats`]
     /// so [`time_wheel`]'s signature (and every existing caller/test) stays
-    /// unchanged for callers that don't need stats tracking.
+    /// unchanged for callers that don't need stats tracking. Only present
+    /// when the `statistics` feature is enabled — see [`attach_stats`].
     ///
     /// [`attach_stats`]: TimeWheelConsumer::attach_stats
+    #[cfg(feature = "statistics")]
     stats: Option<&'static QueueStats>,
 }
 
@@ -201,7 +208,12 @@ pub fn time_wheel(
     let (tx, rx) = RingBuffer::new(ingress_capacity);
     (
         TimeWheelProducer { tx },
-        TimeWheelConsumer { rx, wheel: Wheel::new(n_slots, slot_duration, slot_capacity), stats: None },
+        TimeWheelConsumer {
+            rx,
+            wheel: Wheel::new(n_slots, slot_duration, slot_capacity),
+            #[cfg(feature = "statistics")]
+            stats: None,
+        },
     )
 }
 
@@ -223,10 +235,17 @@ impl TimeWheelConsumer {
     /// it. Typically points at a `QueueStats` embedded in a shared-memory
     /// segment (see `shm.rs`) so an external process can read it live.
     ///
+    /// No-op when the `statistics` feature is disabled, so callers (e.g.
+    /// `main.rs`) don't need to `cfg`-gate the call site.
+    ///
     /// [`drain_block_safe`]: TimeWheelConsumer::drain_block_safe
+    #[cfg(feature = "statistics")]
     pub fn attach_stats(&mut self, stats: &'static QueueStats) {
         self.stats = Some(stats);
     }
+
+    #[cfg(not(feature = "statistics"))]
+    pub fn attach_stats(&mut self, _stats: &'static QueueStats) {}
 
     /// Admit ready entries from the ring buffer into the wheel, then
     /// advance the wheel's clock to `block_start + block_size`, appending
@@ -245,7 +264,10 @@ impl TimeWheelConsumer {
             let params = *chunk.as_slices().0.first().unwrap();
             if params.start_sample < admit_before {
                 chunk.commit_all(); // consume
-                if let Err((_, reason)) = self.wheel.schedule(params, params.start_sample)
+                #[cfg_attr(not(feature = "statistics"), allow(unused_variables))]
+                let result = self.wheel.schedule(params, params.start_sample);
+                #[cfg(feature = "statistics")]
+                if let Err((_, reason)) = result
                     && let Some(stats) = self.stats
                 {
                     let counter = match reason {
@@ -263,6 +285,7 @@ impl TimeWheelConsumer {
         }
         let block_end = block_start + block_size;
         self.wheel.advance(block_end, out);
+        #[cfg(feature = "statistics")]
         if let Some(stats) = self.stats {
             stats.queue_size.store(self.wheel.len() as u64, Ordering::Relaxed);
         }
@@ -521,6 +544,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "statistics")]
     fn drain_block_safe_tracks_queue_size_when_stats_attached() {
         let (mut tx, mut rx) = time_wheel(8, 8, 16, 8); // horizon = 128
         let stats: &'static QueueStats = Box::leak(Box::default());
@@ -535,6 +559,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "statistics")]
     fn drain_block_safe_counts_slot_full_rejections_when_stats_attached() {
         let (mut tx, mut rx) = time_wheel(16, 4, 10, 2); // slot_capacity = 2
         let stats: &'static QueueStats = Box::leak(Box::default());

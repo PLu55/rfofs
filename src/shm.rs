@@ -137,6 +137,14 @@ pub struct SharedControlBlock {
     /// land in the future relative to the *server's* clock — the wheel
     /// rejects anything already behind it as [`crate::queue::RejectReason::TooLate`].
     current_sample: AtomicU64,
+    /// Whether this server binary was built with the `statistics` feature,
+    /// i.e. whether `stats` below is actually kept up to date. Written once
+    /// by `ServerShm::create` from `cfg!(feature = "statistics")`, same
+    /// handshake as `sample_rate_bits`/`block_size`. `stats` itself is
+    /// always present in the layout (so the struct's size/offsets don't
+    /// depend on how the attached client was built) — this flag just tells
+    /// a reader whether to trust its contents.
+    stats_enabled: AtomicU32,
     fof_ring: Ring<FofParams, FOF_CAP>,
     kill_ring: Ring<FofKillRequest, KILL_CAP>,
     pub stats: QueueStats,
@@ -198,6 +206,13 @@ impl SharedControlBlock {
     /// block from the process callback (server side only).
     pub fn set_current_sample(&self, sample: u64) {
         self.current_sample.store(sample, Ordering::Relaxed);
+    }
+
+    /// Whether the attached server was built with the `statistics` feature.
+    /// When `false`, `stats`'s counters are never updated and reading them
+    /// will show all-zero regardless of actual scheduling activity.
+    pub fn stats_enabled(&self) -> bool {
+        self.stats_enabled.load(Ordering::Relaxed) != 0
     }
 
     /// Submit a new FOF request. Called by the client (Racket) side.
@@ -315,6 +330,7 @@ impl ServerShm {
             (*ptr).sample_rate_bits.store(sample_rate.to_bits(), Ordering::Relaxed);
             (*ptr).block_size.store(block_size, Ordering::Relaxed);
             (*ptr).clock_mode.store(clock_mode, Ordering::Relaxed);
+            (*ptr).stats_enabled.store(cfg!(feature = "statistics") as u32, Ordering::Relaxed);
             (*ptr).ready.store(1, Ordering::Release);
         }
 

@@ -11,6 +11,7 @@
 #ifndef RFOFS_CLIENT_H
 #define RFOFS_CLIENT_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -98,6 +99,13 @@ int32_t rfofs_add_fof(ClientHandle* handle,
  * Returns 0 on success, -1 if handle is null, -2 if the shared kill ring is
  * full. */
 int32_t rfofs_kill(ClientHandle* handle, uint64_t id, float fade_dur);
+
+/* Whether the connected server was built with the `statistics` feature,
+ * i.e. whether the counts read back by rfofs_get_stats() are actually being
+ * tracked. When this returns false, rfofs_get_stats() still succeeds but
+ * every field reads back as 0 regardless of real scheduling activity.
+ * Returns false if handle is null. */
+bool rfofs_stats_enabled(ClientHandle* handle);
 
 /* Read a live snapshot of the queue stats into *out.
  *

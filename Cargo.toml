@@ -46,6 +46,12 @@ libc = "0.2"
 # the LUT vs. everything else, or chasing a suspected quantization artifact.
 std-sin = []
 
+# Track scheduling/performance statistics (currently src/queue.rs's
+# QueueStats: too_late/too_early/slot_full rejection counts and live
+# queue_size) into the shared-memory control block. Off by default so the
+# counter writes cost nothing on the audio thread unless explicitly enabled.
+statistics = []
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 

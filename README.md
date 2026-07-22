@@ -38,6 +38,26 @@ Uninstall with:
     sudo make uninstall
     sudo make uninstall PREFIX=/opt/rfofs   # if installed to a custom prefix
 
+### Optional features
+
+`rfofs` has scheduling/performance statistics tracking off by default, so
+the audio thread pays no counter-tracking cost. Enable it with the
+`statistics` Cargo feature:
+
+    cargo build --release --workspace --features statistics
+
+(`make build` doesn't currently pass through feature flags, so build with
+the `cargo` command above instead when you want stats, then `sudo make
+install` as usual to install the resulting binary/library.)
+
+With this feature, the running `rfofs` server keeps its scheduling stats
+(rejected/admitted FOF counts, live queue size — see `QueueStats` in
+`src/queue.rs`) up to date in the shared control block, readable live via
+`rfofs-client`'s `rfofs_get_stats`. A connected client can check
+`rfofs_stats_enabled` to tell whether the server it's attached to was built
+with this feature — without it, `rfofs_get_stats` still succeeds but every
+field reads back as 0.
+
 ### Portability note
 
 `.cargo/config.toml` sets `rustflags = ["-C", "target-cpu=native"]`, so
